@@ -19,7 +19,23 @@ android {
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+    // The release signature: set MCX_RELEASE_KEYSTORE (path), MCX_RELEASE_STORE_PASSWORD and MCX_RELEASE_KEY_ALIAS, and
+    // optionally MCX_RELEASE_KEY_PASSWORD (default: the store password). Without them the release APK stays unsigned.
+    val releaseKeystore = System.getenv("MCX_RELEASE_KEYSTORE")
+    if (!releaseKeystore.isNullOrEmpty()) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("MCX_RELEASE_STORE_PASSWORD")
+                keyAlias = System.getenv("MCX_RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("MCX_RELEASE_KEY_PASSWORD") ?: System.getenv("MCX_RELEASE_STORE_PASSWORD")
+            }
+        }
+    }
     buildTypes {
+        if (!releaseKeystore.isNullOrEmpty()) {
+            getByName("release") { signingConfig = signingConfigs.getByName("release") }
+        }
         // The develop APK (apk/openmcx-client-develop.apk): the debug build, with its debug control for the tests and the
         // same signature, but the libraries shrunk by R8 and unused resources removed.
         create("develop") {

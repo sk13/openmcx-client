@@ -62,8 +62,15 @@ so they install over existing builds with `adb install -r` (no key is stored in 
 ```bash
 tools/gradle-docker.sh :core:test              # JVM unit tests
 tools/gradle-docker.sh :app:assembleDebug      # app/build/outputs/apk/debug/app-debug.apk
+tools/gradle-docker.sh :app:assembleRelease    # app/build/outputs/apk/release/ (signed if the variables below are set)
 tools/instrumented-test.sh <adb-serial>   # instrumented tests (codec, UI, telecom, browser login); leaves the app installed
 ```
+
+Release signing: `assembleRelease` signs with `~/.android/openmcx-release.jks` (alias `openmcx`), which `gradle-docker.sh`
+creates on first use with a random password in `~/.android/openmcx-release.pass`. Back both up: updates must use the same
+key to install over earlier builds. To use another key, export `MCX_RELEASE_KEYSTORE`, `MCX_RELEASE_STORE_PASSWORD`,
+`MCX_RELEASE_KEY_ALIAS` and optionally `MCX_RELEASE_KEY_PASSWORD`. Without a key (Gradle run outside the script) the
+release APK is unsigned.
 
 ## Run against the OpenMCX servers
 

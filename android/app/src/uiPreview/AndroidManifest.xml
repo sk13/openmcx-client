@@ -1,13 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     The UI preview build: the client's screens with sample data, to try the look on a phone. It installs beside the
-    real client (its own application ID) and has none of its engine: no service, no boot or PTT key receivers.
+    real client (its own application ID) and has none of its engine: no service, no PTT key receiver.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <application tools:replace="android:label" android:label="@string/preview_name">
         <activity android:name=".MainActivity" tools:node="remove" />
-        <receiver android:name=".BootReceiver" tools:node="remove" />
         <receiver android:name=".CallActionReceiver" tools:node="remove" />
         <receiver android:name=".KeepaliveReceiver" tools:node="remove" />
         <receiver android:name=".input.PttKeyReceiver" tools:node="remove" />
