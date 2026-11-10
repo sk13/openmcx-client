@@ -12,9 +12,9 @@ import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
 
 /**
- * What the phone's network and SIM offer for SIP core access, shown in Settings, the log and the debug status.
- * The app registers with SIP digest whatever it finds: IMS AKA (TS 33.203) is required on 3GPP access
- * (TS 33.180 clause 6.2.1), and an Android app can run it only with carrier privileges for an ISIM.
+ * What the phone's network and SIM offer for SIP core access, shown in Settings, the log and the debug status. How
+ * the app then registers (IMS AKA with the card, SIP digest, or not at all) is decided at each initial registration
+ * (security/AccessDecision.kt) and shown with these rows.
  */
 object NetworkStatus {
     /** The ISIM application identifier prefix (ETSI TS 101 220 annex E: RID A000000087, application 1004). */
@@ -23,6 +23,8 @@ object NetworkStatus {
     data class Snapshot(
         /** wifi, cellular, ethernet, vpn, other or none: the default network's transport. */
         val transport: String,
+        /** The Wi-Fi generation of the link (e.g. "Wi-Fi 6", from WifiInfo.getWifiStandard), null when not known. */
+        val wifiGeneration: String? = null,
         val validated: Boolean,
         /** A network with the MCX capability (NET_CAPABILITY_MCX) is up, used or not. */
         val mcxNetwork: Boolean,
@@ -33,28 +35,24 @@ object NetworkStatus {
         val carrierPrivileges: Boolean,
         /** true or false when the app can open the ISIM, null when it cannot look (no carrier privileges). */
         val isim: Boolean?,
-        val scheme: String = "SIP digest",
     ) {
         fun json(): JSONObject = JSONObject().put("transport", transport).put("validated", validated).put("mcx_network", mcxNetwork)
             .put("sims", org.json.JSONArray(sims)).put("mobile_network", mobileNetwork ?: JSONObject.NULL).put("carrier_privileges", carrierPrivileges).put("isim", isim ?: JSONObject.NULL)
-            .put("scheme", scheme).put("ims_aka", "not supported")
+
 
         /** One line for the log. */
         fun line(): String = "network: $transport${if (validated) "" else " (not validated)"}, MCX network ${if (mcxNetwork) "up" else "none"}, " +
-            "SIM ${sims.joinToString(" / ")}, mobile network ${mobileNetwork ?: "not registered"}, carrier privileges ${if (carrierPrivileges) "yes" else "no"}, ISIM ${isim?.let { if (it) "yes" else "no" } ?: "unknown"}; " +
-            "$scheme (IMS AKA not supported)"
+            "SIM ${sims.joinToString(" / ")}, mobile network ${mobileNetwork ?: "not registered"}, carrier privileges ${if (carrierPrivileges) "yes" else "no"}, ISIM ${isim?.let { if (it) "yes" else "no" } ?: "unknown"}"
 
         /** Label and value rows for Settings. */
         fun rows(): List<Pair<String, String>> = listOf(
-            "Network" to (when (transport) { "wifi" -> "Wi-Fi"; "vpn" -> "VPN"; "none" -> "none"; else -> transport.replaceFirstChar { it.titlecase() } } +
+            "Network" to (when (transport) { "wifi" -> wifiGeneration ?: "Wi-Fi"; "vpn" -> "VPN"; "none" -> "none"; else -> transport.replaceFirstChar { it.titlecase() } } +
                 if (validated || transport == "none") "" else " (not validated)"),
             "MCX network" to if (mcxNetwork) "up" else "none",
             "SIM" to sims.joinToString("\n"),
             "Mobile network" to (mobileNetwork?.let { "registered on $it" } ?: "not registered"),
             "Carrier privileges" to if (carrierPrivileges) "yes" else "no",
             "ISIM" to (isim?.let { if (it) "present" else "not found" } ?: "unknown, needs carrier privileges"),
-            "Registration" to scheme,
-            "IMS AKA" to "not supported, SIP digest is used",
         )
     }
 
@@ -89,6 +87,14 @@ object NetworkStatus {
             else -> "other"
         }
         val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        // The link's 802.11 generation (Wi-Fi Alliance names); the standard is readable without location permission.
+        val wifiGeneration = (caps?.transportInfo as? android.net.wifi.WifiInfo)?.wifiStandard?.let {
+            when (it) {
+                android.net.wifi.ScanResult.WIFI_STANDARD_11N -> "Wi-Fi 4"; android.net.wifi.ScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5"
+                android.net.wifi.ScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6"; android.net.wifi.ScanResult.WIFI_STANDARD_11BE -> "Wi-Fi 7"
+                else -> null
+            }
+        }
         val mcx = mcxNetworks > 0 || caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_MCX) == true
         val telephony = context.getSystemService(TelephonyManager::class.java)
         // Per slot, without READ_PHONE_STATE: the card state of each slot and, for the default one, the SIM's PLMN.
@@ -115,7 +121,7 @@ object NetworkStatus {
         val mobileNetwork = telephony?.networkOperator?.takeIf { it.length >= 5 }?.let { plmn(it) }
         val privileges = inserted && runCatching { telephony!!.hasCarrierPrivileges() }.getOrDefault(false)
         val isim = if (privileges) isimPresent(telephony!!) else null
-        return Snapshot(transport, validated, mcx, sims, mobileNetwork, privileges, isim)
+        return Snapshot(transport, wifiGeneration, validated, mcx, sims, mobileNetwork, privileges, isim)
     }
 
     private fun plmn(numeric: String) = "${numeric.take(3)}-${numeric.drop(3)}"

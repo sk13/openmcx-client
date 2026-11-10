@@ -53,6 +53,8 @@ data class ClientConfig(
     data class Sip(
         val publicUserId: String, val privateUserId: String, val password: String,
         val proxy: String, val proxyPort: Int, val transport: String, val registerExpires: Int,
+        /** The P-CSCF of the system's IMS AKA offer ("host:port", preconfigured, TS 24.229 §9.2.1); null: not offered. */
+        val imsAkaPcscf: String? = null,
     )
 
     data class Idms(
@@ -86,6 +88,32 @@ data class ClientConfig(
          * in the user profile document, so the provisioning names them; the status notifications add any others.
          */
         val functionalAliases: List<String> = emptyList(),
+        /**
+         * TS 24.484 §6.3.13.2.2: subscribe to the UE configuration, user profile and service configuration documents
+         * through the CMS subscription proxy function (`subscribe_configuration`, on by default).
+         */
+        val subscribeConfiguration: Boolean = true,
+        /** TS 24.481 §6.3.13.2.1: subscribe to the group documents of [groups] (`subscribe_group_documents`, on by default). */
+        val subscribeGroupDocuments: Boolean = true,
+        /**
+         * Read the configuration documents only once their NOTIFY says where they are, and authorise the service after
+         * that (`documents_on_notify`, off by default: the documents are read at sign-in). As TS 37.579-1 table
+         * 5.3.2.6.1-1 expects of a client that subscribes to them.
+         */
+        val documentsOnNotify: Boolean = false,
+        /**
+         * TS 24.484 §6.3.13.2.2 b) 2): "the configured public service identity for performing subscription proxy function
+         * of the CMS" (`cms_subscription_psi`). No configuration item of TS 24.484 §7 names it (a spec gap, reported):
+         * by default the MCPTT server's PSI, as the ETSI test system for TS 37.579 expects.
+         */
+        val cmsSubscriptionPsi: String? = null,
+        /**
+         * TS 24.481 §6.3.13.2.1 b): the GMS subscription proxy PSI, the <GMS-URI> of the UE initial configuration
+         * (TS 24.484 §7.2.2.1 item 4) (`gms_subscription_psi`); without it no group document subscription is made.
+         */
+        val gmsSubscriptionPsi: String? = null,
+        /** The UE ID of the UE configuration document (TS 24.484 §8.2.1) (`ue_id`, by default the client ID). */
+        val ueId: String? = null,
     )
 
     data class Mcdata(
@@ -122,6 +150,21 @@ data class ClientConfig(
          * pending maintainer choice (no spec value).
          */
         val mikeyClockSkewS: Long = Mikey.DEFAULT_CLOCK_SKEW_S,
+        /**
+         * TS 33.180 clause 3.1 ("KMS URI: A unique identifier for a security domain") and annexes D.2.2/D.3.1: the KMS URI
+         * the KMS's documents carry (KmsUri), apart from the HTTPS address [kmsUri] it is contacted at (TS 24.484 clause
+         * 7.2.2.7 <kms>); `kms_id`, by default that address, as the Linux client.
+         */
+        val kmsId: String? = null,
+        /**
+         * `kms_via_proxy` (false by default): the KMS requests go through the home HTTP proxy. TS 24.482 annex A.2.1.2
+         * sends every request but the IdMS's through the proxy, TS 33.180 clause 5.3.2 lets a KMS be used without it,
+         * and no configuration item tells the UE which applies (spec conflict, Known limitations): direct by default; the
+         * option follows the ETSI test system for TS 37.579 (the test suite's reading, a labelled exception, as the Linux
+         * client). Through the proxy, clause 5.3.2: "for public safety users the TrK shall be used": it needs a home
+         * HTTP proxy, and the key management client refuses an exchange without a TrK.
+         */
+        val kmsViaProxy: Boolean = false,
     ) {
         val xcapRoot: String? get() = gmsUri?.takeIf { it.endsWith("org.openmobilealliance.groups") }?.removeSuffix("org.openmobilealliance.groups")
     }
@@ -143,7 +186,8 @@ data class ClientConfig(
                 domain = root.str("domain"),
                 clientId = root.str("client_id"),
                 sip = Sip(sip.str("public_user_id"), sip.str("private_user_id"), sip.str("password"), sip.str("proxy"),
-                    sip.int("proxy_port"), sip.str("transport").uppercase(), sip.int("register_expires", 3600)),
+                    sip.int("proxy_port"), sip.str("transport").uppercase(), sip.int("register_expires", 3600),
+                    sip.optStr("ims_aka_pcscf")),
                 idms = Idms(idms.str("issuer"), idms.str("client_id"), idms.str("redirect_uri"), idms.optStr("username"), idms.optStr("password"),
                     idms.count("token_renewal_lead_s", DEFAULT_TOKEN_RENEWAL_LEAD_S),
                     idms.count("token_refresh_before_s", DEFAULT_TOKEN_REFRESH_BEFORE_S),
@@ -154,7 +198,10 @@ data class ClientConfig(
                 mcptt = (root["mcptt"] as? JsonObject)?.let {
                     Mcptt(it.str("user_id"), it.str("psi"), it.strings("groups"), it.optStr("answer_mode") ?: "automatic",
                         it.int("session_expires", 1800), it.int("manual_answer_timeout", 20),
-                        it.int("profile_index", 1).takeIf { index -> index in 1..255 } ?: 1, it.strings("functional_aliases"))
+                        it.int("profile_index", 1).takeIf { index -> index in 1..255 } ?: 1, it.strings("functional_aliases"),
+                        it.bool("subscribe_configuration", true), it.bool("subscribe_group_documents", true),
+                        it.bool("documents_on_notify", false), it.optStr("cms_subscription_psi")?.also(::sipUri),
+                        it.optStr("gms_subscription_psi")?.also(::sipUri), it.optStr("ue_id"))
                 },
                 mcdata = (root["mcdata"] as? JsonObject)?.let {
                     Mcdata(it.str("user_id"), it.str("psi"), it.strings("groups"), it.int("max_payload_size_sds_cplane_bytes", 1000),
@@ -175,7 +222,13 @@ data class ClientConfig(
                         (it["mikey_clock_skew_s"] as? JsonPrimitive)?.let { skew ->
                             skew.longOrNull?.takeIf { value -> !skew.isString && value in 0..0xffffffffL }
                                 ?: throw ConfigError("mikey_clock_skew_s must be a number of seconds")
-                        } ?: Mikey.DEFAULT_CLOCK_SKEW_S)
+                        } ?: Mikey.DEFAULT_CLOCK_SKEW_S,
+                        it.optStr("kms_id")?.also { id ->
+                            if (id.isEmpty() || id.any { c -> c in "\r\n<>&\"" }) throw ConfigError("kms_id must be a KMS URI")
+                        },
+                        (it["kms_via_proxy"] as? JsonPrimitive)?.let { v ->
+                            v.booleanOrNull?.takeIf { !v.isString } ?: throw ConfigError("security.kms_via_proxy must be a boolean")
+                        } ?: false)
                 },
                 endpoints = (root["endpoints"] as? JsonObject)?.mapValues { it.value.jsonPrimitive.content } ?: emptyMap(),
                 httpProxy = (root["http"] as? JsonObject)?.let { http ->
@@ -188,11 +241,20 @@ data class ClientConfig(
                     val first = it.count("first_retry_ms", DEFAULT_FIRST_RETRY_MS, 1)
                     Recovery(first, it.count("last_retry_ms", maxOf(first, DEFAULT_LAST_RETRY_MS), first))
                 } ?: Recovery(),
-            )
+            ).also { c ->
+                if (c.security?.kmsViaProxy == true && c.httpProxy == null)
+                    throw ConfigError("security.kms_via_proxy needs a home HTTP proxy (http.proxy)")
+            }
         }
 
         private fun JsonObject.obj(key: String) = this[key] as? JsonObject ?: throw ConfigError("missing object $key")
         private fun JsonObject.optStr(key: String) = (this[key] as? JsonPrimitive)?.content
+
+        /** A subscription proxy PSI goes into a Request-URI as it is: a SIP URI, nothing that would break the header. */
+        private fun sipUri(uri: String) {
+            if (!uri.startsWith("sip:") || uri.any { it == '\r' || it == '\n' || it == '<' || it == '>' || it == ' ' })
+                throw ConfigError("not a SIP URI: $uri")
+        }
         private fun JsonObject.str(key: String) = optStr(key) ?: throw ConfigError("missing $key")
         private fun JsonObject.int(key: String, default: Int? = null) =
             (this[key] as? JsonPrimitive)?.intOrNull ?: default ?: throw ConfigError("missing $key")

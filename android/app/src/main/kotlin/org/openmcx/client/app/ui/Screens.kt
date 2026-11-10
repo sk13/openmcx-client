@@ -391,7 +391,8 @@ private fun SettingsScreen(state: UiState, actions: UiActions, close: () -> Unit
                 }
                 state.endpoints.forEach { (name, target) -> Text("$name → $target", style = MaterialTheme.typography.bodySmall) }
             }
-            // Network and SIM under the profile: what the phone offers for IMS AKA; the app registers with SIP digest.
+            // Network and SIM under the profile: the network, the SIM, and how the app registers (IMS AKA with the card or
+            // SIP digest) with its protection.
             Row(Modifier.fillMaxWidth().clickable { networkInfo = !networkInfo }.testTag(Tags.NETWORK_INFO), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) { Section("Network and SIM") }
                 Text(if (networkInfo) "▾" else "▸", color = Mcx.Muted, modifier = Modifier.padding(top = 12.dp))
@@ -658,8 +659,6 @@ private fun VideoScreen(state: UiState, actions: UiActions) {
 @Composable
 private fun FunctionalAliases(state: UiState, actions: UiActions) {
     Section("Functional aliases")
-    Text("A functional alias is a role others can call, such as a dispatcher. Activate one to receive its calls; " +
-        "present it so your calls show it.", style = MaterialTheme.typography.bodySmall, color = Mcx.Muted)
     // A call presents at most one alias (TS 24.379 §9A): say which.
     val presented = state.aliases.filter { it.inUse }.joinToString { CallDisplay.role(it.id) }
     Text(if (presented.isEmpty()) "Your calls present no role." else "Your calls present: $presented",

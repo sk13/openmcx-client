@@ -4,6 +4,9 @@
 
 package org.openmcx.client.client
 
+import org.openmcx.client.sip.ImsAkaConfig
+import org.openmcx.client.sip.ImsAkaPlatform
+import org.openmcx.client.sip.ImsAkaRegistrar
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -25,12 +28,15 @@ import org.openmcx.client.body.PocSettings
 import org.openmcx.client.body.RegInfo
 import org.openmcx.client.body.SimpleFilter
 import org.openmcx.client.documents.DocumentClient
+import org.openmcx.client.documents.DocumentSubscriptions
+import org.openmcx.client.body.ResourceLists
 import org.openmcx.client.documents.GroupDocument
 import org.openmcx.client.documents.ServiceConfig
 import org.openmcx.client.documents.UserProfile
 import org.openmcx.client.http.HttpClient
 import org.openmcx.client.idms.IdmsClient
 import org.openmcx.client.idms.IdmsRefused
+import org.openmcx.client.security.UserTransportKeys
 import org.openmcx.client.security.KeyClient
 import org.openmcx.client.security.KeyMessage
 import org.openmcx.client.security.WireProfile
@@ -137,7 +143,24 @@ data class ClientStatus(
     val networkDeregistered: String? = null,
     /** TS 24.229 §5.1.1.3: the client holds its reg event subscription. */
     val regSubscribed: Boolean = false,
+    /** TS 24.484 §6.3.13.2.2: the final answer to the configuration management SUBSCRIBE, and its NOTIFYs so far. */
+    val configurationSubscription: Int? = null,
+    val configurationNotifications: Int = 0,
+    /** TS 24.481 §6.3.13.2.1: the final answer to the group document SUBSCRIBE, and its NOTIFYs so far. */
+    val groupDocumentSubscription: Int? = null,
+    val groupDocumentNotifications: Int = 0,
 )
+
+/**
+ * How the client reaches the SIP core at its next initial registration, decided then (TS 33.180 clause 6.2.1): SIP
+ * digest over the configured connection, IMS AKA through the P-CSCF with the card, or no registration (e.g. mobile
+ * data without a usable card, where SIP digest "shall not apply", TS 33.203 clauses N.1 and O.1.1), with the reason.
+ */
+sealed interface SipAccess {
+    data object Digest : SipAccess
+    class ImsAka(val platform: ImsAkaPlatform, val config: ImsAkaConfig) : SipAccess
+    class Refused(val reason: String) : SipAccess
+}
 
 /**
  * The MC UE's signalling engine: identity, documents, one outbound flow and its
@@ -160,9 +183,17 @@ class McxClient(
     /**
      * HTTP to the KMS: direct, also with a home HTTP proxy ([http] by default). TS 24.482 annex A.2.1.2
      * sends every request but the IdMS's through the proxy, TS 33.180 §5.3.2 lets a KMS be used without
-     * it, and nothing configured tells the UE which applies: a spec conflict, today's direct connection stays.
+     * it, and nothing configured tells the UE which applies: a spec conflict, direct by default (through the proxy
+     * with security.kms_via_proxy, the test system's reading: [ClientConfig.Security.kmsViaProxy]).
      */
     private val kmsHttp: HttpClient = http,
+    /** The SIP core access of each initial registration ([SipAccess]); SIP digest unless the app decides otherwise. */
+    private val access: suspend () -> SipAccess = { SipAccess.Digest },
+    /**
+     * TS 33.180 clause 5.3.2: the pre-provisioned TrK and InK of an MC service user ID (null without), looked up for
+     * each KMS exchange; the app's are held in the Android Keystore.
+     */
+    private val transportKeys: (String) -> UserTransportKeys? = { null },
 ) {
     val scope = CoroutineScope(parent.coroutineContext + SupervisorJob())
     private val _status = MutableStateFlow(ClientStatus())
@@ -180,30 +211,54 @@ class McxClient(
         clock = clock, endpoints = config.idms.endpoints)
 
     /**
-     * MCVideo's key management client (TS 24.281 4.7, TS 33.180 5.3): it keys as the MCVideo ID, and
-     * its CSK, uploaded at MCVideo service authorisation, protects transmission control (9.4).
+     * The key management client of each service that uses one (TS 33.180 5.3; TS 24.281 4.7 for MCVideo): it keys as
+     * the service's MC service ID; its CSK, uploaded with the service authorisation (TS 24.379 clause 7.2.2 step 3,
+     * TS 24.281 clause 7.2.5), protects floor or transmission control (TS 33.180 clause 9.4).
      */
-    @Volatile var videoKeys: KeyClient? = null
-        private set
-    @Volatile var videoCsk: KeyMessage? = null
-        private set
-    private var videoCskUpload: String? = null
+    private val keyClients = java.util.concurrent.ConcurrentHashMap<McService, KeyClient>()
+    private val csks = java.util.concurrent.ConcurrentHashMap<McService, KeyMessage>()
+    private val cskUploads = java.util.concurrent.ConcurrentHashMap<McService, String>()
 
-    private suspend fun provisionVideoKeys(token: String) {
-        val security = config.security ?: return
-        val mcvideo = config.mcvideo ?: return
-        val account = config.mcptt?.userId ?: mcvideo.userId
-        val keys = videoKeys ?: KeyClient(kmsHttp, security.kmsUri, mcvideo.userId, account,
-            WireProfile(security.messageType, security.algorithm, security.keyParametersIei,
-                security.encryptedPayloadIei),
-            security.mikeyClockSkewS) { event(it) }.also { videoKeys = it }
-        keys.provision(token)
-        if (videoCsk == null) {
-            val (csk, upload) = keys.makeCsk(mcvideo.psi)
-            videoCsk = csk; videoCskUpload = upload
-            event("MCVideo keys: KMS ${security.kmsUri}, CSK %08x".format(csk.csbId))
+    fun keysOf(service: McService): KeyClient? = keyClients[service]
+    fun cskOf(service: McService): KeyMessage? = csks[service]
+    val videoKeys: KeyClient? get() = keyClients[McService.MCVIDEO]
+    val videoCsk: KeyMessage? get() = csks[McService.MCVIDEO]
+
+    /**
+     * Whether [service] has key management: MCVideo whenever the configuration names a KMS (as before); MCPTT when it
+     * also protects media or floor control (TS 24.379 clause 7.2.2 step 3: the CSK with the service authorisation, as
+     * the Linux client; this client has no XML signalling protection, the clause's other condition).
+     */
+    private fun keyed(service: McService): Boolean {
+        val security = config.security ?: return false
+        return when (service) {
+            McService.MCVIDEO -> config.mcvideo != null
+            McService.MCPTT -> config.mcptt != null && (security.protectMedia || security.protectFloor)
+            McService.MCDATA -> false
         }
     }
+
+    private suspend fun provisionKeys(service: McService, token: String) {
+        val security = config.security ?: return
+        val userId = ownId(service)
+        val account = config.mcptt?.userId ?: userId
+        val keys = keyClients[service] ?: KeyClient(kmsHttp, security.kmsUri, userId, account,
+            WireProfile(security.messageType, security.algorithm, security.keyParametersIei,
+                security.encryptedPayloadIei),
+            security.mikeyClockSkewS, { event(it) }, security.kmsId, { transportKeys(userId) }, security.kmsViaProxy)
+            .also { keyClients[service] = it }
+        keys.provision(token)
+        if (csks[service] == null) {
+            val (csk, upload) = keys.makeCsk(psi(service))
+            csks[service] = csk; cskUploads[service] = upload
+            event("${service.name} keys: KMS ${security.kmsUri}, CSK %08x".format(csk.csbId) +
+                if (keys.signedExchange) ", signed KMS exchange" else "")
+        }
+    }
+
+    /** The CSKs go (TS 33.180 9.2.1: a new one with the next service authorisation). */
+    private fun dropCsks() { csks.clear(); cskUploads.clear() }
+
     private val documents = DocumentClient(http, config.cms, config.gms)
 
     @Volatile var tokens: Tokens? = null
@@ -223,6 +278,9 @@ class McxClient(
 
     val handlers = mutableListOf<ServiceHandler>()
     private var registration: SipRequest? = null
+    /** The IMS AKA registration of this life of the client, when it registered with IMS AKA. */
+    @Volatile var imsAka: ImsAkaRegistrar? = null
+        private set
     /** The duration granted to the last registration, seconds (TS 24.229 §5.1.1.4.1 "the previous registration was for"). */
     @Volatile private var registrationDurationS = 0L
 
@@ -247,6 +305,21 @@ class McxClient(
      * with each new flow, which no NOTIFY of them reaches.
      */
     private val endingSubscriptions: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * A subscription to configuration management documents (TS 24.484 §6.3.13.2.2) or group documents (TS 24.481
+     * §6.3.13.2.1): its initial SUBSCRIBE (known by Call-ID before the 2xx, RFC 6665 §4.1.2.4: a NOTIFY may come
+     * first), its dialog once accepted, and when it expires (seconds of [clock], 0: none known). No refresh timer: the
+     * next initial registration subscribes anew (as the Linux client).
+     */
+    private class DocumentSubscription(val request: SipRequest) {
+        @Volatile var dialog: Dialog? = null
+        @Volatile var expiresAt: Long = 0
+    }
+    @Volatile private var configSubscription: DocumentSubscription? = null
+    private val groupDocSubscriptions = ConcurrentHashMap<String, DocumentSubscription>()
+    /** With `documents_on_notify`: completed once the documents of the first configuration NOTIFY have been read. */
+    @Volatile private var configurationRead: CompletableDeferred<Unit>? = null
     private val subscriptions = ConcurrentHashMap<McService, Subscription>()
     private val authEtags = ConcurrentHashMap<McService, String>()
     private val affiliationEtags = ConcurrentHashMap<McService, String>()
@@ -310,6 +383,11 @@ class McxClient(
                     _status.update { it.copy(lastError = e.message, registered = false, offlineSince = it.offlineSince ?: now,
                         nextRetryAt = now + backoff / 1000) }
                     ua.flow?.close(e)
+                    imsAka?.close()
+                    // TS 24.229 §5.1.1.3: the next initial registration subscribes anew; the subscription of this one
+                    // goes with its flow (a start-up that failed after the registration left it in place).
+                    regCancel()
+                    dropDocumentSubscriptions()
                     // Back off, unless told to reconnect now (a new network, or the user's Retry now).
                     if (!reconnectNow.isCompleted) withTimeoutOrNull(backoff) { reconnectNow.await() }
                     backoff = nextBackoff(backoff)
@@ -321,6 +399,7 @@ class McxClient(
 
     fun stop() {
         ua.flow?.close()
+        imsAka?.close()
         scope.cancel()
     }
 
@@ -385,6 +464,7 @@ class McxClient(
             subscription.dialog?.let { unsubscribe(it, service, Affiliation.CONTENT_TYPE) }
         }
         subscriptions.clear()
+        endDocumentSubscriptions(send = true)
         val answers = mutableMapOf<String, Int>()
         for (service in listOf(McService.MCVIDEO, McService.MCDATA, McService.MCPTT)) {
             val etag = authEtags.remove(service) ?: continue
@@ -399,7 +479,7 @@ class McxClient(
             event("${service.name} MC log-off (PUBLISH Expires 0): $status")
         }
         affiliationEtags.clear()
-        videoCsk = null; videoCskUpload = null
+        dropCsks()
         // The SIP de-REGISTER ends likewise with its final response or at Timer F (RFC 3261 §17.1.2.2).
         val deregistered = runCatching { deregister() }.getOrNull()
         event("SIP de-REGISTER (REGISTER Expires 0): $deregistered")
@@ -439,10 +519,13 @@ class McxClient(
     /** One keepalive on the current flow now; false (and a reconnect under way) when it is dead. */
     suspend fun probeFlow(): Boolean = ua.flow?.probe() ?: false
 
+    /** The protection of the SIP flow's own connection (e.g. "TLS 1.3"), null without one or for plain TCP. */
+    val sipConnectionSecurity: String? get() = ua.flow?.connection?.security
+
     /** Run a refresh now instead of at its timer: `register`, `subscription` or `token`. */
     suspend fun refreshNow(what: String) {
         when (what) {
-            "register" -> register(config.sip.registerExpires)
+            "register" -> register(registerExpires())
             "subscription" -> refreshSubscription(McService.MCPTT)
             "token" -> renewToken()
             else -> throw IllegalArgumentException("refresh register|subscription|token")
@@ -492,18 +575,38 @@ class McxClient(
      */
     private suspend fun run() {
         setPhase("connecting")
-        val connection = connector.connect(config.sip.proxy, config.sip.proxyPort)
-        val flow = SipFlow(scope, connection, ::receive, { dir, m -> trace(dir, m) }, keepaliveMs = keepaliveMs)
-        ua.flow = flow
-        flow.start()
-        event("flow ${connection.localHost}:${connection.localPort} → ${config.sip.proxy}:${config.sip.proxyPort} ${connection.transport}")
         endingSubscriptions.clear()
-        register(config.sip.registerExpires)
+        val lifeline: CompletableDeferred<Throwable?>
+        when (val chosen = access()) {
+            is SipAccess.Refused -> {
+                event("no SIP registration: ${chosen.reason}")
+                throw IllegalStateException(chosen.reason)
+            }
+            is SipAccess.ImsAka -> {
+                val registrar = ImsAkaRegistrar(scope, ua, chosen.config, chosen.platform, ::contactParams,
+                    { dir, m -> trace(dir, m) }, ::event, keepaliveMs)
+                imsAka = registrar
+                lifeline = registrar.closed
+                // TS 24.229 §5.1.1.2.1: the UE asks for 600 000 seconds.
+                register(IMS_AKA_REGISTER_EXPIRES)
+            }
+            SipAccess.Digest -> {
+                imsAka = null
+                val connection = connector.connect(config.sip.proxy, config.sip.proxyPort)
+                val flow = SipFlow(scope, connection, ::receive, { dir, m -> trace(dir, m) }, keepaliveMs = keepaliveMs)
+                ua.flow = flow
+                flow.start()
+                event("flow ${connection.localHost}:${connection.localPort} → ${config.sip.proxy}:${config.sip.proxyPort} ${connection.transport}")
+                lifeline = flow.closed
+                register(config.sip.registerExpires)
+            }
+        }
         _status.update { it.copy(registered = true, networkDeregistered = null) }
         // TS 24.229 §5.1.1.3: subscribe "upon receipt of a 2xx response to the initial registration" (and on a new
         // flow, whose registration binds a new flow, the subscription of the old one being gone); not awaited.
         scope.launch { regSubscribe() }
-        authenticateUser(flow)
+        authenticateUser(lifeline)
+        if (documentsOnNotify()) configureFromNotify(lifeline)
         config.mcptt?.let { bringUp(McService.MCPTT, it.groups.ifEmpty { profile?.groups ?: emptyList() }) }
         config.mcdata?.let { bringUp(McService.MCDATA, it.groups) }
         config.mcvideo?.let { bringUp(McService.MCVIDEO, it.groups) }
@@ -511,11 +614,12 @@ class McxClient(
         _status.update { it.copy(lastError = null, offlineSince = null, nextRetryAt = null) }
         housekeeping?.cancel()
         housekeeping = scope.launch { housekeeping() }
-        val cause = flow.closed.await()
+        val cause = lifeline.await()
         housekeeping?.cancel()
         _status.update { it.copy(registered = false) }
         setPhase("flow-lost")
         regCancel()
+        dropDocumentSubscriptions()
         subscriptions.clear()
         handlers.forEach { runCatching { it.flowLost() } }
         throw IllegalStateException("flow closed: ${cause?.message ?: "locally"}")
@@ -531,7 +635,7 @@ class McxClient(
      * Retry now; the registration is kept and refreshed meanwhile. A lost flow, a log-off or IdMS's sign-out ends the
      * attempts ([start] takes over).
      */
-    private suspend fun authenticateUser(flow: SipFlow) {
+    private suspend fun authenticateUser(lifeline: CompletableDeferred<Throwable?>) {
         var backoff = config.recovery.firstRetryMs
         while (true) {
             val refresher = scope.launch { keepRegistered() }
@@ -545,12 +649,12 @@ class McxClient(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (loggedOff || signedOut || flow.closed.isCompleted) throw e
+                if (loggedOff || signedOut || lifeline.isCompleted) throw e
                 event("limited service: sign-in failed: ${e.message}")
                 _status.update { it.copy(limitedService = true, lastError = e.message, nextRetryAt = clock() + backoff / 1000) }
                 setPhase("limited-service")
-                withTimeoutOrNull(backoff) { select<Unit> { reconnectNow.onAwait {}; flow.closed.onAwait {} } }
-                if (flow.closed.isCompleted) throw IllegalStateException("flow closed in the limited service state", e)
+                withTimeoutOrNull(backoff) { select<Unit> { reconnectNow.onAwait {}; lifeline.onAwait {} } }
+                if (lifeline.isCompleted) throw IllegalStateException("flow closed in the limited service state", e)
                 backoff = nextBackoff(backoff)
                 if (reconnectNow.isCompleted) reconnectNow = CompletableDeferred()
                 _status.update { it.copy(nextRetryAt = null) }
@@ -569,12 +673,13 @@ class McxClient(
             delay(5_000)
             if (clock() < nextRegisterAt) continue
             try {
-                register(config.sip.registerExpires)
+                register(registerExpires())
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
                 event("registration refresh failed: ${e.message}")
                 ua.flow?.close(e)
+                imsAka?.close()
                 return
             }
         }
@@ -596,41 +701,54 @@ class McxClient(
         adopt(t)
         _status.update { it.copy(passwordLogins = it.passwordLogins + 1) }
         event("logged in; token expires in ${t.expiresAt - clock()} s")
-        config.mcptt?.let { mcptt ->
-            runCatching { documents.userProfile(mcptt.userId, mcptt.profileIndex, t.accessToken) }
-                .onSuccess { up ->
-                    profile = up
-                    event("user profile: groups ${up.groups}, private call targets ${up.privateCallTargets}, functional aliases ${up.functionalAliases}")
-                    // The provisioning names the aliases, or else the CMS user profile does (TS 24.484 §8.3.2.1 <FunctionalAliasList>):
-                    // the profile read now replaces the one remembered from before.
-                    aliasChannels[McService.MCPTT]?.let { channel ->
-                        if (mcptt.functionalAliases.isEmpty()) channel.state.update { it.copy(available = up.functionalAliases) }
-                    }
-                }
-                .onFailure { event("user profile: ${it.message}") }
-        }
+        // With documents_on_notify the MCPTT documents are read when their NOTIFY comes (TS 24.484 §6.3.13.2.2,
+        // TS 24.481 §6.3.13.2.1), not now: the user profile, the MCPTT service configuration and the group documents.
+        val onNotify = documentsOnNotify()
+        if (!onNotify) config.mcptt?.let { readUserProfile(it, t.accessToken) }
         // TS 24.379, TS 24.281 and TS 24.282 §6.2.8.1.15: the Resource-Priority values of each service's service
         // configuration document; without them, emergency and imminent peril requests cannot be made.
-        for (service in listOfNotNull("mcptt".takeIf { config.mcptt != null }, "mcvideo".takeIf { config.mcvideo != null },
-                "mcdata".takeIf { config.mcdata != null })) {
-            runCatching { documents.serviceConfiguration(service, t.accessToken) }
-                .mapCatching { text ->
-                    if (service == "mcptt") mcpttFloorQueue = ServiceConfig.floorQueue(text)
-                    serviceProtection = serviceProtection + (service to ServiceConfig.signallingProtection(text))
-                    ServiceConfig.resourcePriorities(text)
+        for (service in listOfNotNull("mcptt".takeIf { config.mcptt != null && !onNotify }, "mcvideo".takeIf { config.mcvideo != null },
+                "mcdata".takeIf { config.mcdata != null })) readServiceConfiguration(service, t.accessToken)
+        val subscribedGroups = if (onNotify && groupDocumentsSubscribed()) config.mcptt?.groups.orEmpty().toSet() else emptySet()
+        for (group in ((config.mcptt?.groups ?: emptyList()) + (config.mcdata?.groups ?: emptyList())).distinct() - subscribedGroups)
+            readGroupDocument(group, t.accessToken)
+    }
+
+    /** TS 24.484 §8.3.1A: the user profile; the functional aliases from it unless the provisioning names them. */
+    private suspend fun readUserProfile(mcptt: ClientConfig.Mcptt, token: String) {
+        runCatching { documents.userProfile(mcptt.userId, mcptt.profileIndex, token) }
+            .onSuccess { up ->
+                profile = up
+                event("user profile: groups ${up.groups}, private call targets ${up.privateCallTargets}, functional aliases ${up.functionalAliases}")
+                // The provisioning names the aliases, or else the CMS user profile does (TS 24.484 §8.3.2.1 <FunctionalAliasList>):
+                // the profile read now replaces the one remembered from before.
+                aliasChannels[McService.MCPTT]?.let { channel ->
+                    if (mcptt.functionalAliases.isEmpty()) channel.state.update { it.copy(available = up.functionalAliases) }
                 }
-                .onSuccess { serviceResourcePriorities = serviceResourcePriorities + (service to it)
-                    event("service configuration $service: $it" + if (service == "mcptt") ", floor queue $mcpttFloorQueue" else "") }
-                .onFailure { event("service configuration $service: ${it.message}") }
-        }
-        for (group in ((config.mcptt?.groups ?: emptyList()) + (config.mcdata?.groups ?: emptyList())).distinct()) {
-            runCatching { documents.group(group, t.accessToken) }
-                .onSuccess {
-                    groupDocuments = groupDocuments + (group to it)
-                    event("group $group: services ${it.services.map { s -> s.substringAfterLast('.') }}")
-                }
-                .onFailure { event("group $group: ${it.message}") }
-        }
+            }
+            .onFailure { event("user profile: ${it.message}") }
+    }
+
+    /** A service configuration document: the floor queue (MCPTT), signalling protection, Resource-Priority values. */
+    private suspend fun readServiceConfiguration(service: String, token: String) {
+        runCatching { documents.serviceConfiguration(service, token) }
+            .mapCatching { text ->
+                if (service == "mcptt") mcpttFloorQueue = ServiceConfig.floorQueue(text)
+                serviceProtection = serviceProtection + (service to ServiceConfig.signallingProtection(text))
+                ServiceConfig.resourcePriorities(text)
+            }
+            .onSuccess { serviceResourcePriorities = serviceResourcePriorities + (service to it)
+                event("service configuration $service: $it" + if (service == "mcptt") ", floor queue $mcpttFloorQueue" else "") }
+            .onFailure { event("service configuration $service: ${it.message}") }
+    }
+
+    private suspend fun readGroupDocument(group: String, token: String) {
+        runCatching { documents.group(group, token) }
+            .onSuccess {
+                groupDocuments = groupDocuments + (group to it)
+                event("group $group: services ${it.services.map { s -> s.substringAfterLast('.') }}")
+            }
+            .onFailure { event("group $group: ${it.message}") }
     }
 
     /** Take new tokens, once they name this client and user. */
@@ -669,8 +787,14 @@ class McxClient(
 
     // Registration (TS 24.379 §7.2.1, TS 24.282 §7.2.1, RFC 5626).
 
-    private fun registerContact(): String =
-        "<${ua.contactUri()}>;+sip.instance=\"<${config.clientId}>\";reg-id=1;+g.3gpp.mcptt;+g.3gpp.mcdata.sds;" +
+    private fun registerContact(): String = "<${ua.contactUri()}>" + contactParams()
+
+    /** The expiry a REGISTER asks for: TS 24.229 §5.1.1.2.1's 600 000 s with IMS AKA, else the configured one. */
+    private fun registerExpires(): Int = if (imsAka != null) IMS_AKA_REGISTER_EXPIRES else config.sip.registerExpires
+
+    /** The Contact's header field parameters: +sip.instance, reg-id and the MC feature tags. */
+    private fun contactParams(): String =
+        ";+sip.instance=\"<${config.clientId}>\";reg-id=1;+g.3gpp.mcptt;+g.3gpp.mcdata.sds;" +
             (if (config.mcdata != null) "+g.3gpp.mcdata.fd;" else "") +
             (if (config.mcvideo != null) "+g.3gpp.mcvideo;" else "") +
             "+g.3gpp.icsi-ref=\"${Icsi.encoded(Icsi.MCPTT)},${Icsi.encoded(Icsi.MCDATA)},${Icsi.encoded(Icsi.MCDATA_SDS)}" +
@@ -679,6 +803,13 @@ class McxClient(
 
     private suspend fun register(expires: Int): Int {
         setPhase("registering")
+        imsAka?.let { aka ->
+            val granted = aka.register(expires)
+            registrationDurationS = granted.toLong()
+            nextRegisterAt = clock() + RegEventRules.refreshDelayS(granted.toLong(), granted.toLong())
+            event("registered with IMS AKA for $granted s, P-Associated-URI ${aka.associatedUris.joinToString(", ")}")
+            return granted
+        }
         val previous = registration
         val request = if (previous == null) ua.newRequest("REGISTER", "sip:${config.domain}", NameAddr(config.sip.publicUserId))
         else ua.newRequest("REGISTER", "sip:${config.domain}", NameAddr(config.sip.publicUserId), from = previous.from,
@@ -703,6 +834,7 @@ class McxClient(
 
     /** RFC 3261 §10.2.2: remove this registration (its Contact, Expires 0); the final status. */
     private suspend fun deregister(): Int? {
+        imsAka?.let { return it.deregister() }
         val previous = registration ?: return null
         val request = ua.newRequest("REGISTER", "sip:${config.domain}", NameAddr(config.sip.publicUserId), from = previous.from,
             callId = previous.callId, cseq = (ua.lastSent[previous.callId] ?: previous).cseq.number + 1)
@@ -948,8 +1080,9 @@ class McxClient(
         }
         for (subscription in subscriptions.values) endingSubscriptions.add(subscription.request.callId)
         subscriptions.clear()
+        dropDocumentSubscriptions()
         authEtags.clear(); affiliationEtags.clear()
-        videoCsk = null; videoCskUpload = null
+        dropCsks()
         for (service in McService.entries) updateService(service) { ServiceState() }
     }
 
@@ -989,6 +1122,20 @@ class McxClient(
      * read, so that whether it does is not known) is not started: its service authorisation would go out unprotected.
      * Null when the service may start.
      */
+    /**
+     * TS 33.180 clause 5.3.2: through the home HTTP proxy "the TrK shall be used" (`kms_via_proxy`): a keyed service whose
+     * MC service user ID has no TrK cannot get its keys, so it is not started (the others are), with the reason.
+     */
+    private fun transportKeyRefusal(service: McService): String? {
+        val security = config.security ?: return null
+        if (!security.kmsViaProxy || !keyed(service) || transportKeys(ownId(service))?.trk != null) return null
+        return "${service.name} not started: its key management server is reached through the HTTP proxy, which needs a " +
+            "transport key this app does not hold for ${ownId(service)}"
+    }
+
+    /** Why [service] is not started (protection the app lacks, or no TrK for a KMS through the proxy); null if it may. */
+    private fun notStarted(service: McService): String? = protectionRefusal(service) ?: transportKeyRefusal(service)
+
     private fun protectionRefusal(service: McService): String? {
         val protection = serviceProtection[service.name.lowercase()]
             ?: return "${service.name} not started: its service configuration could not be read"
@@ -999,7 +1146,7 @@ class McxClient(
 
     /** The service authorisation; false (and the reason in the service's state) when the service is not started. */
     private suspend fun authorise(service: McService): Boolean {
-        protectionRefusal(service)?.let { reason ->
+        notStarted(service)?.let { reason ->
             updateService(service) { it.copy(authorised = false, refused = reason) }
             event(reason)
             return false
@@ -1009,12 +1156,12 @@ class McxClient(
         val answerMode = when (service) {
             McService.MCPTT -> config.mcptt!!.answerMode; McService.MCVIDEO -> config.mcvideo!!.answerMode; McService.MCDATA -> null
         }
-        if (service == McService.MCVIDEO && config.security != null) provisionVideoKeys(token)
+        if (keyed(service)) provisionKeys(service, token)
         // TS 24.281 7.2.5: the MCVideo CSK goes to the MCVideo server with the authorisation, in application/mikey.
         // TS 33.180 9.2.1.2 and 9.2.1.3: it is uploaded at the initial connection and stays in use for the session, so a
         // later authorisation (a renewed access token) carries none; the server keeps it with the publication.
         val parts = { listOfNotNull(infoPart(service, token = token), Part(PocSettings.CONTENT_TYPE, PocSettings.encode(config.clientId, answerMode).toByteArray()),
-            videoCskUpload?.takeIf { service == McService.MCVIDEO }?.let { Part("application/mikey", it.toByteArray()) }) }
+            cskUploads[service]?.let { Part("application/mikey", it.toByteArray()) }) }
         var request = serviceRequest(service, "PUBLISH", "poc-settings", parts()).also { it.headers.add("Expires", "4294967295") }
         authEtags[service]?.let { request.headers.add("SIP-If-Match", it) }
         var response = ua.send(request)
@@ -1022,7 +1169,7 @@ class McxClient(
             // The server lost our publication (a restart): authorise afresh, then everything after it again. Its CSK
             // went with it, and an I_MESSAGE is accepted once only (RFC 3830 replay protection): upload a new CSK.
             authEtags.remove(service); affiliationEtags.remove(service)
-            if (service == McService.MCVIDEO && config.security != null) { videoCsk = null; provisionVideoKeys(token) }
+            if (keyed(service)) { csks.remove(service); cskUploads.remove(service); provisionKeys(service, token) }
             request = serviceRequest(service, "PUBLISH", "poc-settings", parts()).also { it.headers.add("Expires", "4294967295") }
             response = ua.send(request)
         }
@@ -1030,14 +1177,182 @@ class McxClient(
         // warning 164, MCVideo 166, MCData 228) means the user is authorised on another client: the retry succeeds
         // once that one logs off or its authorisation ends. A refused request may still have spent its CSK upload (the
         // server opens it first): the retry uploads a new CSK.
-        if (!response.isSuccess && service == McService.MCVIDEO && videoCskUpload != null) videoCsk = null
+        if (!response.isSuccess && cskUploads[service] != null) csks.remove(service)
         if (!response.isSuccess) throw IllegalStateException("${service.name} service authorisation: ${response.status} ${response.reason}" +
             (response.headers["Warning"]?.let { " ($it)" } ?: ""))
         response.headers["SIP-ETag"]?.let { authEtags[service] = it }
-        if (service == McService.MCVIDEO) videoCskUpload = null // the server has the CSK
+        cskUploads.remove(service) // the server has the CSK
         updateService(service) { it.copy(authorised = true, refused = null) }
         event("${service.name} authorised")
         return true
+    }
+
+    // Configuration management and group document subscriptions (TS 24.484 §6.3.13.2.2, TS 24.481 §6.3.13.2.1).
+
+    /**
+     * A request of the configuration subscription (its SUBSCRIBE, a NOTIFY or answer in its dialog) while the MCPTT
+     * service configuration is not known yet: it passes the protection gate ([protectionRefusal]), which would otherwise
+     * stop the subscription that brings that document. TS 24.484 §6.3.13.2.2 d) asks for identity hiding "if identity
+     * hiding is required", which the client learns from that document; once it is known and requires protection, the
+     * gate refuses as for any MCPTT request (as the Linux client, which sends this SUBSCRIBE before it knows).
+     */
+    private fun configurationPending(request: SipRequest): Boolean =
+        serviceProtection["mcptt"] == null && configSubscription?.request?.callId == request.callId
+
+    /** The MCPTT documents are read when the configuration subscription's NOTIFY comes, not at sign-in. */
+    private fun documentsOnNotify() = config.mcptt?.let { it.documentsOnNotify && it.subscribeConfiguration } == true
+
+    /** The group documents of the MCPTT groups come with a group document subscription. */
+    private fun groupDocumentsSubscribed() = config.mcptt?.let { it.subscribeGroupDocuments && it.gmsSubscriptionPsi != null } == true
+
+    /**
+     * The initial SUBSCRIBE to [uri] for [entries] (TS 24.484 §6.3.13.2.2, TS 24.481 §6.3.13.2.1, both "according
+     * to ... IETF RFC 5875"): items b) 1) / a) the resource list, c) the mcptt-info body with the access token, e) the
+     * MCPTT ICSI in P-Preferred-Service, f) the MCPTT ICSI in the Contact. Event xcap-diff, Expires of RFC 5875 §4.5.
+     * Identity hiding (item d)) needs XML protection, which this client does not have: a service whose service
+     * configuration asks for it is not started ([protectionRefusal]).
+     */
+    private fun documentSubscription(uri: String, entries: List<String>, token: String): DocumentSubscription {
+        val request = ua.newRequest("SUBSCRIBE", uri, NameAddr(uri))
+        val (type, body) = Multipart.encode(listOf(infoPart(McService.MCPTT, token = token),
+            Part(ResourceLists.CONTENT_TYPE, DocumentSubscriptions.resourceList(entries).toByteArray())))
+        request.headers.add("P-Preferred-Service", icsi(McService.MCPTT)).add("Event", DocumentSubscriptions.EVENT)
+            .add("Accept", DocumentSubscriptions.ACCEPT).add("Contact", contactFor(McService.MCPTT))
+            .add("Expires", DocumentSubscriptions.EXPIRES_SECONDS.toString()).add("Content-Type", type)
+        return DocumentSubscription(SipRequest(request.method, request.uri, request.headers, body))
+    }
+
+    /**
+     * Sends [subscription]'s SUBSCRIBE; the final status, the dialog and the expiry (RFC 6665 §4.1.2.1: the 2xx's
+     * Expires, else the one asked for). A refused SUBSCRIBE creates no subscription (§4.1.2.1).
+     */
+    private suspend fun send(subscription: DocumentSubscription, what: String): Int {
+        val response = runCatching { ua.send(subscription.request) }.getOrElse { event("$what: ${it.message}"); return 0 }
+        if (!response.isSuccess) { event("$what refused: ${response.status} ${response.reason}"); return response.status }
+        subscription.dialog = runCatching { Dialog.fromResponse(ua.lastSent[subscription.request.callId] ?: subscription.request, response) }.getOrNull()
+        val granted = response.headers["Expires"]?.trim()?.toLongOrNull() ?: DocumentSubscriptions.EXPIRES_SECONDS
+        subscription.expiresAt = if (granted > 0) clock() + granted else 0
+        event("$what: ${response.status}, $granted s")
+        return response.status
+    }
+
+    /**
+     * TS 24.484 §6.3.13.2.2: one SUBSCRIBE for the user's UE configuration, user profile and MCPTT service configuration,
+     * to the CMS subscription proxy PSI (b) 2), configured, else the MCPTT server's PSI). True when accepted.
+     */
+    private suspend fun subscribeConfiguration(token: String): Boolean {
+        val mcptt = config.mcptt ?: return false
+        val entries = DocumentSubscriptions.configurationEntries(mcptt.userId, mcptt.ueId ?: config.clientId, mcptt.profileIndex)
+        val subscription = documentSubscription(mcptt.cmsSubscriptionPsi ?: mcptt.psi, entries, token)
+        configSubscription = subscription
+        val status = send(subscription, "configuration subscription")
+        _status.update { it.copy(configurationSubscription = status) }
+        val accepted = status in 200..299
+        if (!accepted && configSubscription === subscription) configSubscription = null
+        return accepted
+    }
+
+    /** TS 24.481 §6.3.13.2.1: one SUBSCRIBE for the group documents of the MCPTT groups, to the GMS-URI (b)). */
+    private suspend fun subscribeGroupDocuments(token: String) {
+        val mcptt = config.mcptt ?: return
+        val uri = mcptt.gmsSubscriptionPsi ?: run { event("group document subscription: no GMS-URI configured"); return }
+        val groups = mcptt.groups.ifEmpty { profile?.groups ?: emptyList() }.distinct()
+        if (groups.isEmpty()) return
+        val subscription = documentSubscription(uri, DocumentSubscriptions.groupEntries(groups), token)
+        groupDocSubscriptions[subscription.request.callId] = subscription
+        val status = send(subscription, "group document subscription for $groups")
+        _status.update { it.copy(groupDocumentSubscription = status) }
+        if (status !in 200..299) groupDocSubscriptions.remove(subscription.request.callId)
+    }
+
+    /**
+     * With `documents_on_notify`: the configuration subscription, then its first NOTIFY and the documents it names,
+     * before the service authorisation (TS 37.579-1 table 5.3.2.5.1-1 NOTE 1: the PUBLISH follows the user profile).
+     * A refusal fails the start-up, which is tried again ([start]).
+     */
+    private suspend fun configureFromNotify(lifeline: CompletableDeferred<Throwable?>) {
+        val token = tokens?.accessToken ?: throw IllegalStateException("no access token")
+        val read = CompletableDeferred<Unit>()
+        configurationRead = read
+        try {
+            setPhase("configuring")
+            if (!subscribeConfiguration(token)) throw IllegalStateException("configuration subscription not accepted")
+            select<Unit> { read.onAwait {}; lifeline.onAwait {} }
+            if (lifeline.isCompleted && !read.isCompleted) throw IllegalStateException("flow closed while waiting for the configuration")
+        } finally {
+            configurationRead = null
+        }
+    }
+
+    /** After the service authorisation: the subscriptions that are not made before it. */
+    private suspend fun subscribeDocuments() {
+        val mcptt = config.mcptt ?: return
+        val token = tokens?.accessToken ?: return
+        if (mcptt.subscribeConfiguration && configSubscription == null) subscribeConfiguration(token)
+        if (mcptt.subscribeGroupDocuments && groupDocSubscriptions.isEmpty()) subscribeGroupDocuments(token)
+    }
+
+    /**
+     * A NOTIFY of the configuration subscription (RFC 5875: handled by re-reading the subscribed documents): the UE
+     * configuration, the user profile and the MCPTT service configuration, through the home HTTP proxy when one is
+     * configured.
+     */
+    private suspend fun configurationNotified() {
+        val mcptt = config.mcptt ?: return
+        val token = tokens?.accessToken ?: return
+        _status.update { it.copy(configurationNotifications = it.configurationNotifications + 1) }
+        runCatching { documents.ueConfiguration(mcptt.userId, mcptt.ueId ?: config.clientId, token) }
+            .onSuccess { event("UE configuration read") }.onFailure { event("UE configuration: ${it.message}") }
+        readUserProfile(mcptt, token)
+        readServiceConfiguration("mcptt", token)
+        configurationRead?.complete(Unit)
+    }
+
+    /** A NOTIFY of a group document subscription (RFC 5874): each changed group document read again. */
+    private suspend fun groupDocumentsNotified(request: SipRequest) {
+        val token = tokens?.accessToken ?: return
+        _status.update { it.copy(groupDocumentNotifications = it.groupDocumentNotifications + 1) }
+        val diff = Multipart.parse(request.contentType, request.body).firstOrNull { it.mediaType == DocumentSubscriptions.ACCEPT }?.text ?: return
+        val changed = runCatching { DocumentSubscriptions.parse(diff) }.getOrElse { event("group document NOTIFY: ${it.message}"); return }
+        for (document in changed) {
+            val group = DocumentSubscriptions.groupOf(document.selector) ?: continue
+            if (document.newEtag == null) { groupDocuments = groupDocuments - group; event("group $group: document removed"); continue }
+            readGroupDocument(group, token)
+        }
+    }
+
+    /**
+     * The document subscriptions end: at MC log-off each one with a SUBSCRIBE Expires 0 in its dialog (RFC 6665
+     * §4.1.2.3; [send] false after the registration is gone), its final NOTIFY answered 200 ([endingSubscriptions]).
+     */
+    private suspend fun endDocumentSubscriptions(send: Boolean) {
+        val all = listOfNotNull(configSubscription) + groupDocSubscriptions.values
+        configSubscription = null
+        groupDocSubscriptions.clear()
+        for (subscription in all) {
+            endingSubscriptions.add(subscription.request.callId)
+            val dialog = subscription.dialog ?: continue
+            if (!send) continue
+            val request = ua.inDialog(dialog, "SUBSCRIBE")
+            request.headers.add("P-Preferred-Service", icsi(McService.MCPTT)).add("Event", DocumentSubscriptions.EVENT).add("Expires", "0")
+            val status = runCatching { ua.send(request).status }.getOrNull()
+            event("document subscription ended (SUBSCRIBE Expires 0): $status")
+        }
+    }
+
+    /** The same without sending: the flow or the registration is gone. */
+    private fun dropDocumentSubscriptions() {
+        for (subscription in listOfNotNull(configSubscription) + groupDocSubscriptions.values) endingSubscriptions.add(subscription.request.callId)
+        configSubscription = null
+        groupDocSubscriptions.clear()
+    }
+
+    /** A subscription whose expiry passed is gone (RFC 6665 §4.1.2.2); the next initial registration subscribes anew. */
+    private fun expireDocumentSubscriptions() {
+        val now = clock()
+        configSubscription?.let { if (it.expiresAt in 1..now) { configSubscription = null; event("configuration subscription expired") } }
+        for ((callId, subscription) in groupDocSubscriptions)
+            if (subscription.expiresAt in 1..now) { groupDocSubscriptions.remove(callId); event("group document subscription expired") }
     }
 
     // Affiliation (TS 24.379 §9.2.1, TS 24.282 §8.2).
@@ -1100,6 +1415,10 @@ class McxClient(
 
     private suspend fun bringUp(service: McService, groups: List<String>) {
         if (!authorise(service)) return
+        // Once MCPTT is authorised: the document subscriptions not made before it (as the Linux client, after the
+        // service authorisation), next to the affiliation.
+        if (service == McService.MCPTT)
+            scope.launch { runCatching { subscribeDocuments() }.onFailure { event("document subscriptions: ${it.message}") } }
         subscribe(service)
         if (groups.isNotEmpty()) affiliate(service, groups)
         // §9A.2.1.1: the status determination of the aliases this user may use, before any status change.
@@ -1247,13 +1566,26 @@ class McxClient(
         while (scope.isActive) {
             delay(5_000)
             val now = clock()
+            expireDocumentSubscriptions()
             val t = tokens
             if (t != null && t.expiresAt - now < renewalLead()) {
                 renewToken()
                 setPhase("ready")
             }
             if (now >= nextRegisterAt) {
-                register(config.sip.registerExpires)
+                // A failed reregistration ends the flow, so that [start] makes an initial registration (TS 24.229
+                // §5.1.1.4.1: the UE can reregister "via an initial registration" at any time; it shall after a 403,
+                // 408, 500 or 504). Uncaught, it would end this loop and leave the client "ready" without a registration.
+                try {
+                    register(registerExpires())
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    event("registration refresh failed: ${e.message}")
+                    ua.flow?.close(e)
+                    imsAka?.close()
+                    return
+                }
                 setPhase("ready")
             }
             if (now >= nextSubscription) {
@@ -1271,24 +1603,43 @@ class McxClient(
 
     init {
         ua.onRequest = { tx -> dispatch(tx) }
-        // A service that is not started (protectionRefusal) sends nothing: no operation of it goes out unprotected.
+        // A service that is not started (notStarted) sends nothing: no operation of it goes out unprotected.
         // Its requests inside a dialog need no check, as neither side can create one (outgoing: here; incoming:
         // dispatch).
         ua.outboundGate = { request ->
-            mcServiceOf(request)?.let { service -> protectionRefusal(service)?.let { throw IllegalStateException(it) } }
+            if (!configurationPending(request))
+                mcServiceOf(request)?.let { service -> notStarted(service)?.let { throw IllegalStateException(it) } }
         }
     }
 
     private suspend fun dispatch(tx: ServerTransaction) {
         val request = tx.request
         // A request of a service that is not started gets the answer of a service this client does not run.
-        if (mcServiceOf(request)?.let { protectionRefusal(it) } != null) { notHandled(tx); return }
+        if (!configurationPending(request) && mcServiceOf(request)?.let { notStarted(it) } != null) { notHandled(tx); return }
         if (request.method == "NOTIFY" && eventPackage(request) == RegEventRules.EVENT) { regNotify(tx); return }
         // RFC 6665 §4.1.2.3: a subscription this client ended lasts until its final NOTIFY, which is answered 200.
         if (request.method == "NOTIFY" && request.callId in endingSubscriptions) {
             tx.respond(200)
             if ((request.headers["Subscription-State"] ?: "").trim().startsWith("terminated")) endingSubscriptions.remove(request.callId)
             return
+        }
+        // TS 24.484 §6.3.13.2.2, TS 24.481 §6.3.13.2.1: a NOTIFY of a document subscription, answered 200 (RFC 6665
+        // §4.1.3), its documents read after the answer; "terminated" ends the subscription.
+        if (request.method == "NOTIFY" && eventPackage(request) == DocumentSubscriptions.EVENT) {
+            val configuration = configSubscription?.takeIf { it.request.callId == request.callId }
+            val groups = groupDocSubscriptions[request.callId]
+            if (configuration != null || groups != null) {
+                tx.respond(200)
+                val terminated = (request.headers["Subscription-State"] ?: "").trim().startsWith("terminated")
+                if (configuration != null) {
+                    if (terminated && configSubscription === configuration) { configSubscription = null; event("configuration subscription terminated") }
+                    scope.launch { runCatching { configurationNotified() }.onFailure { event("configuration NOTIFY: ${it.message}") } }
+                } else {
+                    if (terminated) { groupDocSubscriptions.remove(request.callId); event("group document subscription terminated") }
+                    scope.launch { runCatching { groupDocumentsNotified(request) }.onFailure { event("group document NOTIFY: ${it.message}") } }
+                }
+                return
+            }
         }
         val aliasChannel = aliasChannels.values.firstOrNull { it.request?.callId == request.callId }
         if (request.method == "NOTIFY" && request.headers["Event"]?.substringBefore(';')?.trim() == "presence" && aliasChannel != null) {
@@ -1354,3 +1705,6 @@ class EventLog(private val capacity: Int = 500) {
 
     fun trace(direction: String, message: SipMessage) { tracer?.invoke(direction, message) }
 }
+
+/** TS 24.229 §5.1.1.2.1: "the value of 600 000 seconds as the value desired for the duration of the registration". */
+private const val IMS_AKA_REGISTER_EXPIRES = 600_000

@@ -231,6 +231,12 @@ class DebugControl(private val context: Context) {
             JSONObject().put("group", a.group).put("latitude", a.location?.latitude).put("longitude", a.location?.longitude)
         })
         "video-tamper-pck" -> { mcvideo().tamperNextPck = true; "next PCK tampered" }
+        "keys" -> JSONObject().put("kms", Engine.client?.keysOf(org.openmcx.client.body.McService.MCPTT)?.kms?.kmsUri)
+            .put("csk_id", Engine.client?.cskOf(org.openmcx.client.body.McService.MCPTT)?.csbId)
+            .put("identity", Engine.client?.keysOf(org.openmcx.client.body.McService.MCPTT)?.identity)
+            .put("group_keys", JSONObject(mcptt().groupKeyIds))
+            .put("signed_kms_exchange", Engine.client?.keysOf(org.openmcx.client.body.McService.MCPTT)?.signedExchange)
+            .put("transport_keys", JSONObject(Engine.transportKeySummary.mapValues { JSONArray(it.value.sorted()) }))
         "video-keys" -> JSONObject().put("kms", Engine.client?.videoKeys?.kms?.kmsUri).put("csk_id", Engine.client?.videoCsk?.csbId)
             .put("identity", Engine.client?.videoKeys?.identity).put("group_keys", JSONObject(mcvideo().groupKeyIds))
         "video-push" -> videoJson(mcvideo().push(Engine.mcvideoId(args[0])))
@@ -488,10 +494,12 @@ class DebugControl(private val context: Context) {
 
     private fun status(): JSONObject {
         val network = NetworkStatus.current.value?.json() ?: JSONObject.NULL
-        val client = Engine.client ?: return JSONObject().put("phase", "not-started").put("network", network)
+        val access = org.openmcx.client.app.security.AccessDecision.json(Engine.client?.imsAka)
+        val client = Engine.client ?: return JSONObject().put("phase", "not-started").put("network", network).put("sip_access", access)
         val s = client.status.value
         fun service(state: org.openmcx.client.client.ServiceState) =
             JSONObject().put("authorised", state.authorised).put("affiliations", JSONObject(state.affiliations))
+                .put("refused", state.refused ?: JSONObject.NULL)
         return JSONObject().put("phase", s.phase).put("registered", s.registered)
             .put("user", client.config.sip.publicUserId)
             .put("mcptt", service(s.mcptt)).put("mcdata", service(s.mcdata)).put("mcvideo", service(s.mcvideo))
@@ -501,8 +509,12 @@ class DebugControl(private val context: Context) {
             .put("offline_since", s.offlineSince ?: JSONObject.NULL).put("next_retry_at", s.nextRetryAt ?: JSONObject.NULL)
             .put("signed_out", s.signedOut ?: JSONObject.NULL)
             .put("network_deregistered", s.networkDeregistered ?: JSONObject.NULL).put("reg_subscribed", s.regSubscribed)
+            .put("documents", JSONObject().put("configuration_subscription", s.configurationSubscription ?: JSONObject.NULL)
+                .put("configuration_notifications", s.configurationNotifications)
+                .put("group_subscription", s.groupDocumentSubscription ?: JSONObject.NULL)
+                .put("group_notifications", s.groupDocumentNotifications))
             .put("flow", client.ua.flow?.connection?.let { "${it.localHost}:${it.localPort}" })
-            .put("network", network)
+            .put("network", network).put("sip_access", access)
             .put("pid", android.os.Process.myPid())
             // The service's foreground types as the app sees them: Android 13's dumpsys does not print them.
             .put("fgs_types", (context as? android.app.Service)?.takeIf { android.os.Build.VERSION.SDK_INT >= 29 }?.foregroundServiceType ?: JSONObject.NULL)
