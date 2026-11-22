@@ -10,6 +10,9 @@
 // TS 33.180 V19.4.0 (Rel-19).
 
 #include "client.hpp"
+#include <cstdlib>
+#include <fstream>
+#include <set>
 
 #include <charconv>
 
@@ -45,6 +48,9 @@ void Client::tick() {
       if (at && std::time(nullptr) >= at) refresh_extra_key_subscription(dialog);
   if (mcvideo_keys_ && mcvideo_key_refresh_at_ && std::time(nullptr) >= mcvideo_key_refresh_at_)
     refresh_key_subscription(true);
+  if (mcvideo_keys_)
+    for (const auto &[dialog, at] : std::map(mcvideo_extra_key_refresh_at_))
+      if (at && std::time(nullptr) >= at) mcvideo_refresh_extra_key_subscription(dialog);
   configuration_subscription_tick();
   status_["protected_media"] = protected_media();
   status_["protected_floor"] = protected_floor();
@@ -95,12 +101,42 @@ void Client::tick() {
 // end of received media, and the end of this user's transmission once the floor is lost.
 void Client::floor_participant_tick(std::uint64_t now) {
   const bool receiving = floor_timers_.remote_media_active();
+  const bool awaiting_confirmation = floor_timers_.awaiting_user_confirmation();
   for (const auto &packet : floor_timers_.tick(now)) transmit_floor(packet);
-  for (const auto type : floor_timers_.take_failed())
+  // TS 24.380 clause 6.2.4.9.13: T132 expired: the Floor Release is sent and "may indicate to the user that the floor
+  // is no more available".
+  if (awaiting_confirmation && !floor_timers_.awaiting_user_confirmation()) {
+    status_["floor_unavailable"] = status_.value("floor_unavailable", 0u) + 1;
+    floor_event("floor_unavailable");
+  }
+  for (const auto type : floor_timers_.take_failed()) {
+    if (type == FloorType::QueuedFloorRequests) {
+      // TS 24.380 clause 6.2.4.7.5: "shall provide a Queued Floor Requests timeout to the MCPTT client".
+      auto &queued = status_["queued_requests"];
+      if (!queued.is_object()) queued = Json::object();
+      queued["state"] = "timeout";
+      queued["timeouts"] = queued.value("timeouts", 0u) + 1;
+      floor_event("queued_requests_timeout");
+      continue;
+    }
+    if (type == FloorType::Request) {
+      // TS 24.380 clause 6.2.4.4.6 step 1: "shall provide a floor request timeout notification to the user".
+      status_["floor_request_timeouts"] = status_.value("floor_request_timeouts", 0u) + 1;
+      floor_event("floor_request_timeout");
+    }
     failure("floor procedure timeout for type " + std::to_string(static_cast<unsigned>(type)));
+  }
   if (receiving && !floor_timers_.remote_media_active()) {
-    receive_ssrc_ = 0;
-    status_["floor_owner"] = "";
+    // TS 24.380 clause 11.1.1: T103 expired, the RTP media "has completed".
+    if (talkers_.size() <= 1) {
+      receive_ssrc_ = 0;
+      status_["floor_owner"] = "";
+    }
+    mix_talkers(true);
+    if (status_.value("media_rendering", false)) {
+      status_["media_rendering"] = false;
+      event("media_rendering", {{"on", false}});
+    }
   }
   const auto state = floor_timers_.state();
   if (state == FloorParticipantState::NoPermission || state == FloorParticipantState::PendingRelease) {
@@ -110,10 +146,15 @@ void Client::floor_participant_tick(std::uint64_t now) {
       const Json loss{{"state", state == FloorParticipantState::NoPermission ? "NoPermission" : "PendingRelease"},
                       {"last_message", last_floor_message_}};
       status_["last_floor_loss"] = loss;
-      event("floor_lost", loss);
+      floor_event("floor_lost", loss);
     }
+    // The talk burst staged for an implicit floor request still waiting for its answer (upgrade_implicit_begin: an
+    // upgrade's re-INVITE with "mc_implicit_request") is kept: the participant stays in 'U: has no permission' until
+    // the answer (TS 24.380 clause 6.2.4.2.2 step 4) and, once granted, sends it in 'U: has permission' until the
+    // user releases (clauses 6.2.4.5.2, 6.2.4.5.3). Dropping it here made the grant end at once with Floor Release.
+    const bool staged = implicit_offered_ && !talking_ && !requesting_;
     talking_ = requesting_ = false;
-    transmit_.clear();
+    if (!staged) transmit_.clear();
   }
 }
 
@@ -168,9 +209,40 @@ void Client::send_speech_frame(const std::array<std::int16_t, 320> &frame, bool 
 }
 
 //------------------------------------------------------------------------------
+// Lab use only, like SSLKEYLOGFILE: with the environment variable MCX_CSK_KEYLOGFILE set, each CSK the client holds
+// (MCPTT, MCVideo, MCData) is appended once to that file as "CSK <MC service user ID> <CSK-ID> <hex key> <hex RAND>",
+// so that a capture of its protected signalling (TS 33.180 clause 9.3) and transmission/floor control (clause 9.4)
+// can be decrypted by a test system. Nothing is written without the variable.
+namespace {
+void keylog_csk(const std::optional<keying::KeyMessage> &csk, const std::string &user) {
+  static std::set<std::pair<std::string, std::uint32_t>> logged;
+  const char *file = std::getenv("MCX_CSK_KEYLOGFILE");
+  if (!file || !*file || !csk || user.empty() || !logged.emplace(user, csk->csb_id).second) return;
+  static const char *digits = "0123456789abcdef";
+  auto hex = [](auto begin, auto end) {
+    std::string out;
+    for (auto it = begin; it != end; ++it) {
+      const auto byte = static_cast<std::uint8_t>(*it);
+      out += digits[byte >> 4];
+      out += digits[byte & 15];
+    }
+    return out;
+  };
+  std::ofstream log(file, std::ios::app);
+  log << "CSK " << user << ' ' << csk->csb_id << ' ' << hex(csk->key.begin(), csk->key.end()) << ' '
+      << hex(csk->random.begin(), csk->random.end()) << '\n';
+}
+} // namespace
+
+//------------------------------------------------------------------------------
 // Helper: the status file (every 200 ms): the floor state, priorities, call, services, registration and
 // authorisation, then the MCData and MCVideo parts; the received audio is saved with it.
 void Client::save_status(std::uint64_t now) {
+  if (std::getenv("MCX_CSK_KEYLOGFILE")) {
+    keylog_csk(csk_, cfg_.contains("mcptt") ? user() : std::string());
+    keylog_csk(mcvideo_csk_, cfg_.contains("mcvideo") ? mcvideo_user() : std::string());
+    keylog_csk(mcdata_csk_, cfg_.contains("mcdata") ? mcdata_user() : std::string());
+  }
   floor_and_priority_status();
   // A listened-to client shows no call (TS 24.379 clause 11.1.6.2.0); the "ambient" entry is
   // test instrumentation, not a user indication.
@@ -186,7 +258,10 @@ void Client::save_status(std::uint64_t now) {
                                         {"null_alert", ambient_->null_alert},
                                         {"attached", !dialog_.empty() && dialog_ == ambient_->dialog},
                                         {"transmitting", hidden && talking_},
-                                        {"connected", hidden && remote_.has_value()}};
+                                        {"connected", hidden && remote_.has_value()},
+                                        // The floor participant state of the hidden call (protocol state only).
+                                        {"floor_state", hidden ? status_.value("floor_state", "") : ""},
+                                        {"floor_owner", hidden ? status_.value("floor_owner", "") : ""}};
   status_["last_ambient"] = last_ambient_;
   status_["first_to_answer"] = first_to_answer_;
   status_["private_emergency_state"] = mepc_name(mepc_);
@@ -246,9 +321,24 @@ void Client::save_status(std::uint64_t now) {
   status_["talking"] = talking_ && !hidden;
   status_["requesting_floor"] = requesting_;
   status_["received_samples"] = received_.size();
+  // TS 24.379 clauses 7.2.3, 7.2.4, 9.2.1.3, 9.2.1.5 and 9.2.1.6: service_settings, settings_publication,
+  // affiliation_command, group_dynamic_data and target_affiliations (core/settings_affiliation.cpp).
+  procedures_status(mcptt_service);
   if (mcdata_enabled()) mcdata_status();
   if (mcvideo_enabled()) mcvideo_status();
-  write_status(cfg_, status_);
+  if (hidden) {
+    // TS 24.379 clauses 11.1.6.2.0 and 11.1.6.2.1.2 6): the listened-to user is not shown the call nor its floor; the
+    // floor participant state goes on (TS 24.380 clause 6.2.4) and is reported under "ambient" only.
+    auto shown = status_;
+    shown["floor_state"] = "NoPermission";
+    shown["floor_owner"] = "";
+    shown["requesting_floor"] = false;
+    shown["queued"] = false;
+    shown["pending_floor_confirmation"] = false;
+    write_status(cfg_, shown);
+  } else {
+    write_status(cfg_, status_);
+  }
   save_audio();
   last_save_ = now;
 }
@@ -262,7 +352,17 @@ void Client::floor_and_priority_status() {
   case FloorParticipantState::HasPermission: status_["floor_state"] = "HasPermission"; break;
   case FloorParticipantState::PendingRelease: status_["floor_state"] = "PendingRelease"; break;
   case FloorParticipantState::Queued: status_["floor_state"] = "Queued"; break;
+  case FloorParticipantState::Releasing: status_["floor_state"] = "Releasing"; break;
   }
+  talkers_status();
+  status_["media_flow"] = media_flow_stopped_ ? "stopped" : "flowing";
+  status_["floor_overridden"] = floor_overridden_;
+  status_["floor_overriding"] = floor_overriding_;
+  status_["queued_requests_pending"] = floor_timers_.queued_requests_pending();
+  for (const auto *counter : {"floor_request_timeouts", "floor_unavailable"})
+    if (!status_.contains(counter)) status_[counter] = 0;
+  if (!status_.contains("media_rendering")) status_["media_rendering"] = false;
+  if (!status_.contains("queued_requests")) status_["queued_requests"] = Json::object();
   status_["priority"] = emergency_ ? "emergency" : imminent_ ? "imminent" : "normal";
   status_["alerts"] = alerts_;
   // The group whose emergency alerts "alerts" lists: during a call on a monitored group that call's, else the
@@ -274,6 +374,24 @@ void Client::floor_and_priority_status() {
       remote_ && remote_->floor_priority ? Json(*remote_->floor_priority) : Json(nullptr);
   status_["answer_mode"] = cfg_.at("mcptt").value("answer_mode", "auto");
   status_["group_id"] = group();
+  status_["group"] = group();
+  status_["imminent_group_state"] = imminent_group_states_;
+  status_["emergency_state"] = emergency_state_; // TS 24.379 annex G.1
+  status_["adhoc_redirections"] = adhoc_redirections_; // TS 24.379 clause 17.2.7.1
+  // TS 24.379 clause 17.2.2.1: the preconfigured group keying the ad hoc call, and those whose GMKs are wanted.
+  status_["adhoc_security_group"] = adhoc_security_group_;
+  status_["adhoc_security_groups"] = adhoc_security_groups_;
+  // TS 24.379 clause 18.1.1: "sent" {target, group, status, warning, outcome, request} of this user's last trigger,
+  // "received" {from, group, status, warning, floor_requested} of the last one received.
+  status_["remote_floor"] = remote_floor_;
+  // TS 24.379 clause 9A.2.1.3: whether this user's functional alias status subscription is in place ("active" from
+  // its SUBSCRIBE until a NOTIFY ends it, else "none"); its last answer in functional_alias_subscription_result.
+  status_["functional_alias_subscription"] = alias_status_dialog_.empty() ? "none" : "active"; // group -> MIG state (TS 24.379 clause 10.1.6.2) // the selected group (TS 24.379 clauses 9.2.1.2, 10.1.4.2.2 step 2)
+  // TS 24.379 clause 10.1.4.2: "sent", this user's last remote group selection request and its outcome
+  // ({target, group, status, warning, outcome, request[, from]}); "received", the last request received
+  // ({from, group, affiliation_required, outcome}).
+  status_["remote_selection"] = {{"sent", mcptt_procedures_.selection_result},
+                                 {"received", mcptt_procedures_.selection}};
 }
 
 //------------------------------------------------------------------------------
@@ -299,10 +417,17 @@ Client::Client(Json cfg, bool disable_tls)
       sip_(client_sip_config(cfg_, disable_tls),
            {[this](const SipMessage &message) { return incoming(message); },
             [this](std::string_view id, SipCallState state, int code) {
+              if (pre_session_state(id, state)) return;
               if (mcvideo_closing(id, state) || mcvideo_call_state(id, state)) return;
               call_state(id, state, code);
             },
             [this](std::string_view dialog, const MediaDescription &media) {
+              try {
+                if (pre_session_media(dialog, media)) return;
+              } catch (const std::exception &error) {
+                failure(std::string("pre-established session media: ") + error.what());
+                return;
+              }
               if (mcvideo_closing_.contains(std::string(dialog))) return;
               // The media of the MCVideo call's dialog: a refusal ends that call (mcvideo_end_call and its own
               // dialog), never the MCPTT call of dialog_.
@@ -394,6 +519,31 @@ void Client::read_mcvideo_profile() {
   mcvideo_profile_ = {{"user_id", profile.user_id}, {"profile_index", profile.profile_index},
                       {"groups", profile.groups},   {"private_call_targets", profile.private_call_targets},
                       {"actions", profile.actions}, {"etag", response.headers.at("etag")}};
+  // TS 24.281 clause 6.2.8.3.9: the <PrivateCallKMSURI> of each <PrivateCallOnNetwork> entry.
+  mcvideo_profile_["private_call_kms"] = profile.private_call_kms;
+  // TS 24.484 clause 9.3.2.1 item 8 e) v): <MCVideo-group-call>/<Priority>, the configured priority of TS 24.581
+  // clauses 14.2.3 and 14.2.6 (mcvideo_configured_priority).
+  mcvideo_profile_["priority"] = profile.group_call_priority;
+  // TS 24.484 clause 9.3.2.1 items 8 d) ii), 8 e) and 9 f): the target entries of the priority requests (TS 24.281
+  // clauses 6.2.8.1.6, 6.2.8.1.8, 6.2.8.3.1.1, 6.2.8.3.1.3); an absent element is not listed.
+  Json targets = Json::object();
+  for (const auto &[name, entry] : {std::pair{"emergency_group_initiation", &profile.emergency_group_initiation},
+                                    std::pair{"imminent_group_initiation", &profile.imminent_group_initiation},
+                                    std::pair{"group_emergency_alert", &profile.group_emergency_alert},
+                                    std::pair{"emergency_private_recipient", &profile.emergency_private_recipient},
+                                    std::pair{"private_emergency_alert", &profile.private_emergency_alert}})
+    if (entry->present) targets[name] = {{"entry_info", entry->entry_info}, {"uri", entry->uri}};
+  mcvideo_profile_["targets"] = targets;
+  // TS 24.281 clause 20.2.1.4: the functional aliases with location criteria, evaluated from the next position.
+  mcvideo_alias_rules_.clear();
+  mcvideo_alias_area_inside_.clear();
+  Json located = Json::array();
+  for (const auto &alias : profile.functional_aliases)
+    if (alias.has_location_criteria()) {
+      mcvideo_alias_rules_.push_back(alias);
+      located.push_back({{"alias", alias.alias}, {"manual_deactivation_locked", alias.manual_deactivation_locked}});
+    }
+  mcvideo_profile_["location_functional_aliases"] = located;
   status_["mcvideo_profile"] = mcvideo_profile_;
   event("document_retrieved", {{"resource", path}, {"bytes", response.body.size()}});
   event("mcvideo_profile_read", {{"groups", profile.groups.size()}, {"actions", profile.actions.size()}});
@@ -414,6 +564,9 @@ void Client::read_mcdata_profile() {
   if (profile.user_id != mcdata_user() || profile.profile_index != index)
     throw std::runtime_error("MCData user profile of another user or index");
   mcdata_profile_actions_ = profile.actions;
+  mcdata_profile_kms_ = profile.one_to_one_kms;
+  mcdata_alert_entry_info_ = profile.group_alert_entry_info;
+  mcdata_alert_entry_uri_ = profile.group_alert_uri;
   mcdata_profile_loaded_ = true;
   status_["mcdata_profile"] = {{"user_id", profile.user_id},
                                {"profile_index", profile.profile_index},
@@ -452,6 +605,7 @@ void Client::run() {
   while (!stopping) run_once();
   release();
   if (!dialog_.empty()) sip_.bye(dialog_);
+  if (pre_session_) sip_.bye(pre_session_->dialog);
   for (int index = 0; index < 20; index++) sip_.poll(std::chrono::milliseconds(10));
   save_audio();
   sip_.stop();
@@ -578,6 +732,9 @@ void Client::registration_answered(const SipResponse &response) {
     return;
   }
   registered_ = true;
+  // RFC 3261 section 10.2.4: refreshes keep the Call-ID; a new registration (another process, or after a network
+  // deregistration, SipEngine::registration_ended) has its own. The response's dialog ID is its Call-ID.
+  if (!response.dialog_id.empty()) registration_call_id_ = response.dialog_id;
   // TS 24.229 clause 5.1.1.4.1: the duration of this registration, for the reregistration time of a shortened one
   // (core/reg_event.cpp): the expires parameter of the Contact or the Expires header field of the 200 (OK).
   {
@@ -620,6 +777,8 @@ void Client::read_service_configurations(std::vector<std::string> services) {
       if (response.status != 200) throw std::runtime_error("HTTP " + std::to_string(response.status));
       service_priorities_[service] = parse_service_resource_priorities(response.body);
       service_protection_[service] = parse_service_protection(response.body);
+      service_adhoc_[service] = parse_service_adhoc(response.body);
+      if (service == "mcdata") mcdata_tx_limits_ = parse_mcdata_tx_limits(response.body);
       event("document_retrieved", {{"resource", path}, {"bytes", response.body.size()}});
     } catch (const std::exception &error) {
       event("service_configuration_unavailable", {{"service", service}, {"reason", error.what()}});
@@ -629,6 +788,12 @@ void Client::read_service_configurations(std::vector<std::string> services) {
   for (const auto &[service, protection] : service_protection_)
     status_["service_protection"][service] = {{"confidentiality", protection.confidentiality},
                                               {"integrity", protection.integrity}};
+  status_["mcdata_tx_limits"] = {
+      {"max_payload_size_sds_cplane_bytes", mcdata_tx_limits_.max_payload_size_sds_cplane
+                                                ? Json(*mcdata_tx_limits_.max_payload_size_sds_cplane)
+                                                : Json(nullptr)}};
+  for (const auto &[service, adhoc] : service_adhoc_)
+    status_["service_adhoc"][service] = {{"supported", adhoc.supported}, {"max_participants", adhoc.max_participants}};
 }
 
 //------------------------------------------------------------------------------
@@ -680,7 +845,9 @@ void Client::load_user_documents() {
   // A user may belong to no group (an account activated without one): then there
   // is no group document to read and nothing to affiliate to.
   if (!group().empty())
-    retrieve(gms_xcap_root(), "/org.openmobilealliance.groups/global/byGroupID/" + xcap_segment(group()));
+    note_group_document(group(), retrieve(gms_xcap_root(), "/org.openmobilealliance.groups/global/byGroupID/" +
+                                                              xcap_segment(group()))
+                                     .body);
 }
 
 //------------------------------------------------------------------------------
@@ -790,6 +957,7 @@ void Client::run_once() {
   for (int index = 0; index < 32; index++) {
     auto datagram = floor_.receive();
     if (!datagram) break;
+    if (pre_session_stun(IceStream::Control, 1, *datagram)) continue; // RFC 7983: ICE checks of the session
     try {
       floor_packet(*datagram);
     } catch (const std::exception &error) {
@@ -805,6 +973,7 @@ void Client::run_once() {
   for (int index = 0; index < 32; index++) {
     auto datagram = audio_.receive();
     if (!datagram) break;
+    if (pre_session_stun(IceStream::Audio, 1, *datagram)) continue;
     try {
       audio_packet(*datagram);
     } catch (const std::exception &error) {
@@ -813,6 +982,7 @@ void Client::run_once() {
     }
   }
   if (mcvideo_enabled()) mcvideo_poll();
+  pre_session_poll();
   try {
     tick();
   } catch (const std::exception &error) {

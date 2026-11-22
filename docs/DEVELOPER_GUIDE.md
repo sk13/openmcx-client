@@ -6,7 +6,8 @@ to add or fix a procedure. It describes the code as it is; what each client supp
 [Linux client feature list](../linux/docs/FEATURES.md), the [dispatcher README](../dispatcher/README.md) and the
 [Android README](../android/README.md).
 
-Specification versions are those the source file headers cite: TS 24.379 V19.7.0, TS 24.380 V19.2.0, TS 24.282
+Specification versions are those of the single source of truth, openMCX/ssot-specs (branch `v19`), which the source
+file headers cite: TS 24.379 V19.7.0, TS 24.380 V19.2.0, TS 24.282
 V19.7.0, TS 24.582 V19.0.0, TS 24.281 V19.6.0, TS 24.581 V19.2.0, TS 26.281 V19.0.0, TS 33.180 V19.4.0, TS 24.481
 V19.3.0, TS 24.482 V19.1.0, TS 24.484 V19.6.0, TS 24.545 V19.4.0 and TS 23.379 V19.11.0, all Release 19.
 
@@ -344,6 +345,10 @@ sequenceDiagram
   information (session type, emergency, imminent peril, broadcast, functional alias, `<associated-group-id>` for a
   regroup) and the Resource-Priority headers (`priority_headers`), then `invite_group_call` sets the floor priority,
   floor SSRC and queueing and sends the INVITE (TS 24.379 clauses 10.1.1.2.1.1 and 10.1.2.2.1.1).
+- Multiplexing (TS 24.379 clause 6.2.10) is the client's `mcptt.multiplex_support` (default `true`). Every MCPTT
+  INVITE and re-INVITE offers `offer_media()` (`core/client.hpp`): with `false` it has no `mc_floor_ssrc` (TS 24.380
+  clause 14.2.7), answers have none (14.3.8), and `negotiated_media` drops the server's (14.4), so the floor control
+  messages go with the client's own SSRC and the server's are told apart by its address and port (clause 8.2.4).
 - `ptt_command` sends Floor Request through `send_floor` (TS 24.380 clause 6.2.4.3.5). `floor_packet` validates
   each floor message (source address and port, SSRC, SRTCP when `security.protect_floor`), acknowledges it when asked,
   filters duplicates (`FloorSequenceTracker`), feeds `FloorParticipantTimers::receive` and acts on Floor Granted,
@@ -371,6 +376,9 @@ sequenceDiagram
   call's dialog, or, outside a call, a SIP MESSAGE that cancels the emergency state of an affiliated user; the
   Resource-Priority comes from the service configuration document (TS 24.379 clauses 10.1.1.2.1.3 to 10.1.1.2.1.5).
   The answer is handled in `priority_response`.
+- `emergency clear`: the user clears the MCPTT emergency state locally, without signalling (TS 24.379 annex G.1
+  "MCPTT user manually clears the state"); while it is set, an ad hoc group call the user places is an emergency one
+  (clause 17.2.2.1.1 step 15).
 - `alert on|off [<user>]` → `change_alert`: the emergency alert and its cancellation by an authorised user (TS 24.379
   clauses 12.1.1.1, 12.1.1.2).
 - In a private call, `emergency on alert` → `change_private_priority`, which moves MEPC, MEPP and MPEA (section 3).

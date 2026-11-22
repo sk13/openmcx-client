@@ -39,7 +39,7 @@ import javax.xml.parsers.DocumentBuilderFactory
  * the dot segments of an absolute value, an empty xml:base when no fix-up is made). Example 3.8 of the Recommendation
  * is read as corrected by W3C erratum E11-01 (2008): only the contiguously omitted ancestors are joined. (The node-sets
  * here, a subtree less a subtree, have no rendered element between omitted ones, the case of that example.)
- * Specifications: TS 33.180 V19.5.0 (Rel-19) clauses 9.3.3 and 9.3.5, annexes D.1, D.2.2, D.3.1 and D.3.5.1; W3C XML
+ * Specifications: TS 33.180 V19.4.0 (Rel-19) clauses 9.3.3 and 9.3.5, annexes D.1, D.2.2, D.3.1 and D.3.5.1; W3C XML
  * Signature Syntax and Processing (Second Edition, 2008) clauses 3.2, 4.3.3 and 6; W3C Canonical XML 1.0 and 1.1; W3C
  * Exclusive XML Canonicalization 1.0; W3C xml:id.
  */
@@ -97,7 +97,7 @@ object KmsSignature {
     }
 
     /** Whether a DOCTYPE comes before the root element: after the XML declaration, white space, comments and PIs. */
-    private fun prologHasDoctype(xml: String): Boolean {
+    internal fun prologHasDoctype(xml: String): Boolean {
         var at = if (xml.startsWith("﻿")) 1 else 0
         while (at < xml.length) {
             when {
@@ -134,7 +134,7 @@ object KmsSignature {
      * The base64 octets of an element's text (RFC 4648 section 4), white space ignored, decoded as OpenSSL's
      * EVP_DecodeBlock does for the shared core ('=' read as zero bits, the padding octets then dropped).
      */
-    private fun unbase64(text: String): ByteArray {
+    internal fun unbase64(text: String): ByteArray {
         val clean = text.filter { it != ' ' && it != '\n' && it != '\r' && it != '\t' }
         need(clean.isNotEmpty() && clean.length % 4 == 0, "invalid base64")
         val out = ByteArray(clean.length / 4 * 3)
@@ -574,7 +574,7 @@ object KmsSignature {
     /**
      * XMLDSig Second Edition clause 4.3.3.3: the element a shortname XPointer names by an ID attribute; exactly one
      * element may carry it. ID attributes: xml:id (W3C xml:id) and the unqualified Id attribute of the KMS schema
-     * (TS 33.180 V19.5.0 annex D.3.5.1 types it xsd:string, a schema defect, reported; resolving it as an ID is the
+     * (TS 33.180 V19.4.0 annex D.3.5.1 types it xsd:string, a schema defect, reported; resolving it as an ID is the
      * reading of the ETSI test suite for TS 37.579, maintainer decision 2026-11-01, not a stated 3GPP rule).
      */
     private fun byId(doc: Document, id: String): Element {

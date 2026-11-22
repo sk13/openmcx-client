@@ -39,7 +39,6 @@ import org.openmcx.client.idms.IdmsRefused
 import org.openmcx.client.security.UserTransportKeys
 import org.openmcx.client.security.KeyClient
 import org.openmcx.client.security.KeyMessage
-import org.openmcx.client.security.WireProfile
 import org.openmcx.client.idms.LoopbackRedirect
 import org.openmcx.client.idms.Tokens
 import org.openmcx.client.mcdata.McdataInfo
@@ -109,9 +108,13 @@ interface ServiceHandler {
     suspend fun logOff() {}
 }
 
-/** [refused]: why the client does not start the service (the system requires what the client does not support). */
+/**
+ * [refused]: why the service is not authorised: the client does not start it (the system requires what the client does
+ * not support), or its key management or its service authorisation failed, in which case [nextRetryAt] (seconds since
+ * the epoch) is when the client tries it again on the same registration.
+ */
 data class ServiceState(val authorised: Boolean = false, val affiliations: Map<String, String> = emptyMap(),
-    val refused: String? = null)
+    val refused: String? = null, val nextRetryAt: Long? = null)
 
 /** What the client reports: its start-up phase and the state of each service. */
 data class ClientStatus(
@@ -202,12 +205,14 @@ class McxClient(
     val ua = UserAgent(scope, UaIdentity(config.sip.publicUserId, config.sip.privateUserId, config.sip.password,
         config.domain, config.clientId))
     private val idms = IdmsClient(idmsHttp, config.idms.issuer, config.idms.clientId, config.idms.redirectUri,
-        // TS 33.180 5.3: a protected client also asks for its key management services (MCPTT and MCVideo here).
+        // TS 33.180 5.3 and table B.4.2.2-1: a client with key management also asks for the key management service of
+        // each configured service (as the Linux client): MCData keys as its MCData ID (TS 24.282 clause 6.6).
         scope = IdmsClient.scope(
             listOfNotNull("ptt".takeIf { config.mcptt != null }, "data".takeIf { config.mcdata != null },
                 "video".takeIf { config.mcvideo != null }),
             if (config.security == null) emptyList()
-            else listOfNotNull("ptt".takeIf { config.mcptt != null }, "video".takeIf { config.mcvideo != null })),
+            else listOfNotNull("ptt".takeIf { config.mcptt != null }, "data".takeIf { config.mcdata != null },
+                "video".takeIf { config.mcvideo != null })),
         clock = clock, endpoints = config.idms.endpoints)
 
     /**
@@ -226,16 +231,47 @@ class McxClient(
 
     /**
      * Whether [service] has key management: MCVideo whenever the configuration names a KMS (as before); MCPTT when it
-     * also protects media or floor control (TS 24.379 clause 7.2.2 step 3: the CSK with the service authorisation, as
-     * the Linux client; this client has no XML signalling protection, the clause's other condition).
+     * protects media or floor control or its service configuration asks for XML protection (TS 24.379 clause 7.2.2
+     * step 3: the CSK with the service authorisation "if either confidentiality protection is enabled ... or integrity
+     * protection is enabled", as the Linux client); MCData when it protects payloads, signalling or authenticates
+     * payloads, or its service configuration asks for XML protection (TS 24.282 clause 6.6: the MCData client signs and
+     * receives PCKs as its MCData ID).
      */
     private fun keyed(service: McService): Boolean {
         val security = config.security ?: return false
         return when (service) {
             McService.MCVIDEO -> config.mcvideo != null
-            McService.MCPTT -> config.mcptt != null && (security.protectMedia || security.protectFloor)
-            McService.MCDATA -> false
+            McService.MCPTT -> config.mcptt != null && (security.protectMedia || security.protectFloor || protection.required(service))
+            McService.MCDATA -> config.mcdata?.let { it.protectPayload || it.protectSignalling || it.authenticatePayload } == true ||
+                (config.mcdata != null && protection.required(service))
         }
+    }
+
+    /**
+     * Whether [service] uploads a CSK with its service authorisation: MCPTT and MCVideo whenever keyed (as the Linux
+     * client); MCData, TS 24.282 clause 7.2.2 step 3, "if either confidentiality protection is enabled as specified in
+     * clause 6.5.2.3.1 or integrity protection is enabled as specified in clause 6.5.3.3.1", and for signalling
+     * protection (clause 6.6), which uses it as well.
+     */
+    private fun uploadsCsk(service: McService): Boolean = when (service) {
+        McService.MCDATA -> config.mcdata?.protectSignalling == true || protection.required(service)
+        else -> true
+    }
+
+    /**
+     * Application signalling security (TS 33.180 clause 9.3): XML confidentiality and integrity under each service's
+     * CSK, and MCData signalling under the MCData CSK, on every message the user agent sends and receives.
+     */
+    val protection = SignallingProtection(config, { serviceProtection[it] }, { csks[it] },
+        { csks[it] != null && cskUploads[it] == null }, clock)
+
+    /** The GMKs of the MCPTT groups (the MCPTT service's, TS 33.180 clause 5.7), which also protect MCData payloads. */
+    @Volatile var mcpttGroupKeys: org.openmcx.client.security.GroupKeys? = null
+
+    /** MCData payload protection (TS 24.282 clause 6.6.3, TS 33.180 clause 8.5), when MCData is configured. */
+    val mcdataProtection: org.openmcx.client.mcdata.McdataProtection? = config.mcdata?.let {
+        org.openmcx.client.mcdata.McdataProtection(it, config.security?.wireProfile, { keyClients[McService.MCDATA] },
+            { mcpttGroupKeys }, clock)
     }
 
     private suspend fun provisionKeys(service: McService, token: String) {
@@ -243,12 +279,12 @@ class McxClient(
         val userId = ownId(service)
         val account = config.mcptt?.userId ?: userId
         val keys = keyClients[service] ?: KeyClient(kmsHttp, security.kmsUri, userId, account,
-            WireProfile(security.messageType, security.algorithm, security.keyParametersIei,
-                security.encryptedPayloadIei),
-            security.mikeyClockSkewS, { event(it) }, security.kmsId, { transportKeys(userId) }, security.kmsViaProxy)
+            security.wireProfile,
+            security.mikeyClockSkewS, { event(it) }, security.kmsId, { transportKeys(userId) },
+            accountTransportKeys = { transportKeys(account) }, viaProxy = security.kmsViaProxy)
             .also { keyClients[service] = it }
         keys.provision(token)
-        if (csks[service] == null) {
+        if (csks[service] == null && uploadsCsk(service)) {
             val (csk, upload) = keys.makeCsk(psi(service))
             csks[service] = csk; cskUploads[service] = upload
             event("${service.name} keys: KMS ${security.kmsUri}, CSK %08x".format(csk.csbId) +
@@ -409,10 +445,19 @@ class McxClient(
     @Volatile private var signedOut = false
     @Volatile private var signInRequest = CompletableDeferred<Unit>()
 
-    /** Try to reach the servers now instead of at the end of the back-off (the user's Retry now). */
+    /** Try to reach the servers now instead of at the end of the back-off (the user's Retry now), and the refused services. */
     fun retryNow() {
         reconnectNow.complete(Unit)
+        val waiting = serviceRetryNow
+        serviceRetryNow = CompletableDeferred()
+        waiting.complete(Unit)
     }
+
+    /** Completed by [retryNow]: the refused services' retries ([retryService]) go at once. */
+    @Volatile private var serviceRetryNow = CompletableDeferred<Unit>()
+
+    /** The retries of the services refused in the current start-up ([refuseService]); they end with it. */
+    private val serviceRetries = java.util.concurrent.ConcurrentHashMap<McService, kotlinx.coroutines.Job>()
 
     /**
      * IdMS refused the refresh token (account suspended, devices revoked, a system that no longer knows the device) and
@@ -536,9 +581,10 @@ class McxClient(
     private suspend fun renewToken() {
         event("renewing the access token")
         refreshTokens()
-        config.mcptt?.let { authorise(McService.MCPTT) }
-        config.mcdata?.let { authorise(McService.MCDATA) }
-        config.mcvideo?.let { authorise(McService.MCVIDEO) }
+        // A refused service is not authorised again here: its retry ([retryService]) takes the new token.
+        if (config.mcptt != null && _status.value.mcptt.authorised) authorise(McService.MCPTT)
+        if (config.mcdata != null && _status.value.mcdata.authorised) authorise(McService.MCDATA)
+        if (config.mcvideo != null && _status.value.mcvideo.authorised) authorise(McService.MCVIDEO)
     }
 
     private suspend fun refreshTokens() {
@@ -607,13 +653,20 @@ class McxClient(
         scope.launch { regSubscribe() }
         authenticateUser(lifeline)
         if (documentsOnNotify()) configureFromNotify(lifeline)
-        config.mcptt?.let { bringUp(McService.MCPTT, it.groups.ifEmpty { profile?.groups ?: emptyList() }) }
-        config.mcdata?.let { bringUp(McService.MCDATA, it.groups) }
-        config.mcvideo?.let { bringUp(McService.MCVIDEO, it.groups) }
-        setPhase("ready")
-        _status.update { it.copy(lastError = null, offlineSince = null, nextRetryAt = null) }
-        housekeeping?.cancel()
-        housekeeping = scope.launch { housekeeping() }
+        try {
+            config.mcptt?.let { bringUp(McService.MCPTT, it.groups.ifEmpty { profile?.groups ?: emptyList() }, lifeline) }
+            config.mcdata?.let { bringUp(McService.MCDATA, it.groups, lifeline) }
+            config.mcvideo?.let { bringUp(McService.MCVIDEO, it.groups, lifeline) }
+            servicesSettled()
+            _status.update { it.copy(offlineSince = null, nextRetryAt = null) }
+            housekeeping?.cancel()
+            housekeeping = scope.launch { housekeeping() }
+            lifeline.await()
+        } finally {
+            // The refused services' retries belong to this registration: a new start-up brings every service up again.
+            serviceRetries.values.forEach { it.cancel() }
+            serviceRetries.clear()
+        }
         val cause = lifeline.await()
         housekeeping?.cancel()
         _status.update { it.copy(registered = false) }
@@ -787,7 +840,21 @@ class McxClient(
 
     // Registration (TS 24.379 §7.2.1, TS 24.282 §7.2.1, RFC 5626).
 
-    private fun registerContact(): String = "<${ua.contactUri()}>" + contactParams()
+    private fun registerContact(): String = "<${ua.contactUri()}>" + contactParams() + mediaFeatureTags
+
+    /**
+     * TS 24.229 §5.1.1.2.1 c), §5.1.3.1 and §5.1.4.1: "The UE shall include the media feature tags defined in RFC 3840
+     * [62] and RFC 5688 [120] for all supported streaming media types" in the REGISTER Contact, the initial INVITE and
+     * the responses to it other than 100 (Trying). RFC 3840 §10 ties each tag to an SDP media type (RFC 4566 §5.14):
+     * "audio" for MCPTT speech, "video" with MCVideo, "application" for the floor control stream ("m=application ... udp
+     * MCPTT", TS 24.380 §12.1.1) and the MCVideo transmission control stream (TS 24.581); base tags in a Contact (RFC
+     * 3840 §9). Not "control" (the RFC 2327 media type, removed by RFC 4566 §8.2.1) and not "+sip.message" for MCData's
+     * MSRP (RFC 4569, which TS 24.229 does not cite). The same tags as the Linux client.
+     */
+    private val mediaFeatureTags: String get() = if (config.mcvideo != null) ";audio;video;application" else ";audio;application"
+
+    /** The Contact of an initial INVITE and of the 18x and 2xx answering one: [contactFor] with the media feature tags. */
+    fun sessionContact(service: McService) = contactFor(service) + mediaFeatureTags
 
     /** The expiry a REGISTER asks for: TS 24.229 §5.1.1.2.1's 600 000 s with IMS AKA, else the configured one. */
     private fun registerExpires(): Int = if (imsAka != null) IMS_AKA_REGISTER_EXPIRES else config.sip.registerExpires
@@ -1117,12 +1184,6 @@ class McxClient(
     }
 
     /**
-     * TS 24.379 §6.6.2.3.1 and §6.6.3.3.1 (TS 24.281 the same, TS 24.282 §6.5.2.3.1 and §6.5.3.3.1): this client has no
-     * XML signalling protection, so a service whose service configuration document enables it (or that could not be
-     * read, so that whether it does is not known) is not started: its service authorisation would go out unprotected.
-     * Null when the service may start.
-     */
-    /**
      * TS 33.180 clause 5.3.2: through the home HTTP proxy "the TrK shall be used" (`kms_via_proxy`): a keyed service whose
      * MC service user ID has no TrK cannot get its keys, so it is not started (the others are), with the reason.
      */
@@ -1133,15 +1194,23 @@ class McxClient(
             "transport key this app does not hold for ${ownId(service)}"
     }
 
-    /** Why [service] is not started (protection the app lacks, or no TrK for a KMS through the proxy); null if it may. */
-    private fun notStarted(service: McService): String? = protectionRefusal(service) ?: transportKeyRefusal(service)
+    /**
+     * Why [service] is not started (its service configuration unknown, protection without key management, or no TrK
+     * for a KMS through the proxy); null if it may.
+     */
+    private fun notStarted(service: McService): String? = configurationRefusal(service) ?: transportKeyRefusal(service)
 
-    private fun protectionRefusal(service: McService): String? {
-        val protection = serviceProtection[service.name.lowercase()]
-            ?: return "${service.name} not started: its service configuration could not be read"
-        return if (protection.first || protection.second)
-            "${service.name} not started: the system requires signalling protection, which this app does not support"
-        else null
+    /**
+     * TS 24.379 §6.6.2.3.1 and §6.6.3.3.1 (TS 24.281 the same, TS 24.282 §6.5.2.3.1 and §6.5.3.3.1): the service
+     * configuration document decides the signalling protection; one that could not be read leaves it unknown, and no
+     * XML body of the service may go out then ([SignallingProtection]): the service is not started. One that asks for
+     * protection needs the service's CSK, so a client configured without a key management server does not start it.
+     */
+    private fun configurationRefusal(service: McService): String? {
+        serviceProtection[service.name.lowercase()] ?: return "${service.name} not started: its service configuration could not be read"
+        if (config.security == null && protection.required(service))
+            return "${service.name} not started: the system requires signalling protection, and no key management server is configured"
+        return null
     }
 
     /** The service authorisation; false (and the reason in the service's state) when the service is not started. */
@@ -1173,7 +1242,8 @@ class McxClient(
             request = serviceRequest(service, "PUBLISH", "poc-settings", parts()).also { it.headers.add("Expires", "4294967295") }
             response = ua.send(request)
         }
-        // §7.2.2: not authorised; the start-up is tried again after a growing delay. A 486 (§7.3.3 steps 3a and 3b,
+        // §7.2.2: not authorised; this service is tried again after a growing delay, on the same registration
+        // ([refuseService]). A 486 (§7.3.3 steps 3a and 3b,
         // warning 164, MCVideo 166, MCData 228) means the user is authorised on another client: the retry succeeds
         // once that one logs off or its authorisation ends. A refused request may still have spent its CSK upload (the
         // server opens it first): the retry uploads a new CSK.
@@ -1191,10 +1261,9 @@ class McxClient(
 
     /**
      * A request of the configuration subscription (its SUBSCRIBE, a NOTIFY or answer in its dialog) while the MCPTT
-     * service configuration is not known yet: it passes the protection gate ([protectionRefusal]), which would otherwise
-     * stop the subscription that brings that document. TS 24.484 §6.3.13.2.2 d) asks for identity hiding "if identity
-     * hiding is required", which the client learns from that document; once it is known and requires protection, the
-     * gate refuses as for any MCPTT request (as the Linux client, which sends this SUBSCRIBE before it knows).
+     * service configuration is not known yet: it passes the start gate ([configurationRefusal]), which would otherwise
+     * stop the subscription that brings that document. The subscription is sent without XML protection
+     * ([SignallingProtection]: identity hiding, TS 24.484 §6.3.13.2.2 d), is not applied, as the Linux client).
      */
     private fun configurationPending(request: SipRequest): Boolean =
         serviceProtection["mcptt"] == null && configSubscription?.request?.callId == request.callId
@@ -1209,8 +1278,8 @@ class McxClient(
      * The initial SUBSCRIBE to [uri] for [entries] (TS 24.484 §6.3.13.2.2, TS 24.481 §6.3.13.2.1, both "according
      * to ... IETF RFC 5875"): items b) 1) / a) the resource list, c) the mcptt-info body with the access token, e) the
      * MCPTT ICSI in P-Preferred-Service, f) the MCPTT ICSI in the Contact. Event xcap-diff, Expires of RFC 5875 §4.5.
-     * Identity hiding (item d)) needs XML protection, which this client does not have: a service whose service
-     * configuration asks for it is not started ([protectionRefusal]).
+     * Identity hiding (item d), "if identity hiding is required") is not applied: the subscription is sent without XML
+     * protection, as the Linux client ([SignallingProtection]).
      */
     private fun documentSubscription(uri: String, entries: List<String>, token: String): DocumentSubscription {
         val request = ua.newRequest("SUBSCRIBE", uri, NameAddr(uri))
@@ -1413,8 +1482,79 @@ class McxClient(
         event("${service.name} affiliated to $groups")
     }
 
-    private suspend fun bringUp(service: McService, groups: List<String>) {
-        if (!authorise(service)) return
+    /**
+     * [service] is not authorised (its key management or its service authorisation failed): the reason in its state,
+     * and a retry on the same registration after the start-up's growing delay ([ClientConfig.recovery], no value of the
+     * specifications: TS 33.180 C-2 and C-3 "may be repeated ... as necessary", without a timer), at once on Retry now.
+     */
+    private fun refuseService(service: McService, groups: List<String>, lifeline: CompletableDeferred<Throwable?>, reason: String) {
+        val message = "${service.name} not authorised: $reason"
+        event(message)
+        updateService(service) { it.copy(authorised = false, refused = message) }
+        _status.update { it.copy(lastError = message) }
+        if (serviceRetries[service]?.isActive == true) return
+        serviceRetries[service] = scope.launch { retryService(service, groups, lifeline) }
+    }
+
+    private suspend fun retryService(service: McService, groups: List<String>, lifeline: CompletableDeferred<Throwable?>) {
+        var backoff = config.recovery.firstRetryMs
+        while (true) {
+            val now = serviceRetryNow
+            updateService(service) { it.copy(nextRetryAt = clock() + backoff / 1000) }
+            withTimeoutOrNull(backoff) { select<Unit> { now.onAwait {}; lifeline.onAwait {} } }
+            if (lifeline.isCompleted || loggedOff || signedOut) return
+            backoff = if (now.isCompleted) config.recovery.firstRetryMs else (backoff * 2).coerceAtMost(config.recovery.lastRetryMs)
+            updateService(service) { it.copy(nextRetryAt = null) }
+            try {
+                if (authorise(service)) bringUpAuthorised(service, groups)
+                servicesSettled()
+                return
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (lifeline.isCompleted || loggedOff || signedOut) return
+                val message = "${service.name} not authorised: ${e.message ?: e}"
+                event(message)
+                updateService(service) { it.copy(authorised = false, refused = message) }
+                _status.update { it.copy(lastError = message) }
+            }
+        }
+    }
+
+    /**
+     * After the services were brought up or retried: "ready" while at least one MC service is authorised, otherwise the
+     * "limited service" state of TS 33.180 clause 5.1.1 (registered, no MC service authorised); the last error stays
+     * while a configured service is not authorised.
+     */
+    private fun servicesSettled() {
+        val states = listOfNotNull(config.mcptt?.let { _status.value.mcptt }, config.mcdata?.let { _status.value.mcdata },
+            config.mcvideo?.let { _status.value.mcvideo })
+        val none = states.isNotEmpty() && states.none { it.authorised }
+        _status.update { it.copy(limitedService = none, lastError = if (states.all { s -> s.authorised }) null else it.lastError) }
+        setPhase(if (none) "limited-service" else "ready")
+    }
+
+    private suspend fun bringUp(service: McService, groups: List<String>, lifeline: CompletableDeferred<Throwable?>) {
+        // TS 33.180 clause 5.1.1: the SIP registration (step A), the user authentication (B) and the MC service
+        // authorisation with its key management (C, C-2 and C-3 "may be repeated ... as necessary") are separate steps;
+        // TS 24.379 clause 7.2.2 (TS 24.281, TS 24.282 the same): a failed authorisation means "the MCPTT client is not
+        // authorised", for that service. So a failed key management or service authorisation of one service leaves the
+        // registration and the other services as they are, and that service is tried again ([refuseService]).
+        val authorised = try {
+            authorise(service)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (loggedOff || signedOut || lifeline.isCompleted) throw e
+            refuseService(service, groups, lifeline, e.message ?: e.toString())
+            return
+        }
+        if (!authorised) return
+        bringUpAuthorised(service, groups)
+    }
+
+    /** After the service authorisation: the documents (MCPTT), the subscription, the affiliation, the aliases. */
+    private suspend fun bringUpAuthorised(service: McService, groups: List<String>) {
         // Once MCPTT is authorised: the document subscriptions not made before it (as the Linux client, after the
         // service authorisation), next to the affiliation.
         if (service == McService.MCPTT)
@@ -1603,6 +1743,8 @@ class McxClient(
 
     init {
         ua.onRequest = { tx -> dispatch(tx) }
+        ua.outgoingBodies = protection::outgoing
+        ua.incomingBodies = protection::incoming
         // A service that is not started (notStarted) sends nothing: no operation of it goes out unprotected.
         // Its requests inside a dialog need no check, as neither side can create one (outgoing: here; incoming:
         // dispatch).

@@ -22,12 +22,14 @@ add_executable(mcx-client
     src/client/core/client.cpp
     src/client/core/commands.cpp
     src/client/core/group_management.cpp
+    src/client/core/group_selection.cpp
     src/client/core/location.cpp
     src/client/core/log_off.cpp
     src/client/core/reg_event.cpp
     src/client/core/main.cpp
     src/client/core/protected_call.cpp
     src/client/core/seal_location.cpp
+    src/client/core/settings_affiliation.cpp
     src/client/core/sip_dispatch.cpp
     src/client/core/tokens.cpp
     src/client/core/transport_key_config.cpp
@@ -42,6 +44,7 @@ add_executable(mcx-client
     src/client/mcptt/multicast.cpp
     src/client/core/mbms.cpp
     src/client/mcptt/priority.cpp
+    src/client/mcptt/pre_established.cpp
     src/client/mcptt/private_call.cpp
     src/client/mcptt/private_services.cpp
     src/client/mcptt/regroup.cpp
@@ -54,6 +57,7 @@ add_executable(mcx-client
     src/client/mcvideo/live_video.cpp
     src/client/mcvideo/location.cpp
     src/client/mcvideo/service.cpp
+    src/client/mcvideo/settings_affiliation.cpp
     src/client/mcvideo/session.cpp
     src/client/mcvideo/multicast.cpp
     # mcdata
@@ -67,7 +71,8 @@ add_executable(mcx-client
     src/client/mcdata/priority.cpp
     src/client/mcdata/protection.cpp
     src/client/mcdata/release.cpp
-    src/client/mcdata/service.cpp)
+    src/client/mcdata/service.cpp
+    src/client/mcdata/settings_affiliation.cpp)
 target_include_directories(mcx-client PRIVATE src/client/core)
 target_compile_options(mcx-client PRIVATE -Wall -Wextra -Wpedantic)
 # Link-time optimisation: the split into files must not cost the inlining the single file had.
