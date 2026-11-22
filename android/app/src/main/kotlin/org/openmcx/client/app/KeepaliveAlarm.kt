@@ -35,7 +35,10 @@ object KeepaliveAlarm {
     )
 }
 
-/** Runs one keepalive under a short wake lock, then schedules the next alarm. */
+/**
+ * Runs one keepalive under a short wake lock, then schedules the next alarm. Without a running client (the process was
+ * killed and the alarm woke it) it does nothing and the alarm ends: it must not keep a stopped app waking itself.
+ */
 class KeepaliveReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val result = goAsync()
@@ -46,7 +49,7 @@ class KeepaliveReceiver : BroadcastReceiver() {
                 val client = Engine.client
                 if (client != null) Engine.log.add("keepalive alarm: flow ${if (client.probeFlow()) "alive" else "dead, reconnecting"}")
             } finally {
-                KeepaliveAlarm.schedule(context.applicationContext)
+                if (Engine.client != null) KeepaliveAlarm.schedule(context.applicationContext)
                 if (lock.isHeld) lock.release()
                 result.finish()
             }

@@ -308,6 +308,16 @@ class Lab:
         if not self.cmd(client, "die", ok=False).get("ok"):
             self.root_shell(client, f"kill -9 {pid}")
 
+    def kill_and_reopen(self, client: str, pid: int) -> dict:
+        """Kill the app, check that Android does not restart it (the service is not sticky and nothing starts the app by
+        itself), then open it as the user would and return the status of the new process."""
+        self.kill_app(client, pid)
+        time.sleep(20)
+        s = self.status_or_none(client)
+        self.check(f"{client} stays down after being killed", s is None or s.get("pid") == pid, status=s and s.get("pid"))
+        self.devices[client].adb("shell", "am", "start", "-n", "org.openmcx.client/.app.MainActivity", check=False)
+        return self.wait(f"{client} restarted", lambda: (s := self.status_or_none(client)) and s.get("pid") != pid and s, timeout=120)
+
     def root_shell(self, client: str, command: str) -> str:
         device = self.devices[client]
         if device.adb("shell", "id", "-u").strip() != "0":
@@ -405,13 +415,12 @@ class Lab:
             self.idle_everywhere([A, B])
         finally:
             self.root_shell(B, "dumpsys deviceidle unforce")
-        # Process death: Android restarts the sticky foreground service, which starts over.
+        # Process death: the service is not sticky and nothing starts the app by itself; it comes back when the user opens it.
         pid = self.status(C)["pid"]
-        self.kill_app(C, pid)
         killed = time.monotonic()
-        s = self.wait("client-c restarted", lambda: (s := self.status_or_none(C)) and s.get("pid") != pid and s["phase"] == "ready" and s,
-                      timeout=120)
-        self.check("client-c is ready again after being killed", s["pid"] != pid,
+        s = self.kill_and_reopen(C, pid)
+        s = self.wait("client-c ready", lambda: (s := self.status_or_none(C)) and s["phase"] == "ready" and s, timeout=120)
+        self.check("client-c is ready again after being killed and opened", s["pid"] != pid,
                    seconds=round(time.monotonic() - killed, 1))
         self.group_call_reaches(A, [B, C], talker=C)
 
@@ -516,8 +525,7 @@ class Lab:
         notes = self.devices[B].adb("shell", "dumpsys", "notification", "--noredact", check=False)
         self.check("bob gets a notification for the message", text in notes)
         pid = self.status(B)["pid"]
-        self.kill_app(B, pid)
-        self.wait("bob restarted", lambda: (s := self.status_or_none(B)) and s.get("pid") != pid and s, timeout=120)
+        self.kill_and_reopen(B, pid)
         history = self.cmd(B, "history", "50")
         self.check("bob's history keeps the message after a restart", any(h["summary"] == text for h in history))
         self.check("bob's history keeps the group call", any(h["kind"] == "call" and h.get("group") == GROUP for h in history))

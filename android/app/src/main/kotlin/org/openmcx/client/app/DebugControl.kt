@@ -85,7 +85,7 @@ class DebugControl(private val context: Context) {
         "retry" -> { Engine.client!!.retryNow(); "retrying" }
         "sign-in" -> { Engine.client!!.signIn(); "signing in" }
         // The process ends as on a crash (SIGKILL, as kill -9) just after the reply, so that the tests can check that
-        // Android restarts the sticky service without root on the phone.
+        // Android does not restart the (not sticky) service, without root on the phone.
         "die" -> "dying".also { Thread { Thread.sleep(300); android.os.Process.killProcess(android.os.Process.myPid()) }.start() }
         // private <target> [auto|manual|force] [no-floor]
         "private" -> call { it.privateCall(args[0], when (args.getOrNull(1) ?: "auto") {

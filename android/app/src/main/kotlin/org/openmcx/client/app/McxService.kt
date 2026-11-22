@@ -70,7 +70,8 @@ class McxService : LifecycleService() {
         if (control == null && BuildConfig.DEBUG) {
             control = lifecycleScope.launch { DebugControl(this@McxService).serve() }
         }
-        return START_STICKY
+        // Not sticky: if the system kills the process the service stays down until the user opens the app again.
+        return START_NOT_STICKY
     }
 
     /**
