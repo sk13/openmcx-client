@@ -7,7 +7,7 @@
 # plus curl and Python for the lab's health checks. Build with tools/build-image, which stages this repository under
 # /client and the needed openmcx-server files under /openmcx-server.
 
-ARG DEV_IMAGE=openmcx-dev:0.4
+ARG DEV_IMAGE=openmcx-dev:0.5
 ARG RUNTIME_BASE=ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
 #------------------------------------------------------------------------------
@@ -35,6 +35,9 @@ COPY openmcx-server/dependencies/hostap/README /usr/share/doc/openmcx-client/hos
 # libsrtp's licence (BSD-3-Clause): the client links the development image's libsrtp, built with OpenMCX's patch
 # (openmcx-server dependencies/libsrtp), statically.
 COPY --from=build /usr/local/share/doc/libsrtp/LICENSE /usr/share/doc/openmcx-client/libsrtp-LICENSE
+# reSIProcate's licences (the Vovida Software License 1.0 and, for its bundled resolver, c-ares's): the client links
+# the development image's rutil, resip and dum statically (openmcx-server dependencies/resiprocate).
+COPY --from=build /opt/resiprocate/share/doc/resiprocate/LICENSE.md /usr/share/doc/openmcx-client/resiprocate-LICENSE.md
 LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       org.opencontainers.image.source="https://github.com/openMCX/openmcx-client"
 WORKDIR /workspace

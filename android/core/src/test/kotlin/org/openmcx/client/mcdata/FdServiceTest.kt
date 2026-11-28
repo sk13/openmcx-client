@@ -41,16 +41,23 @@ class FdServiceTest {
     /** The MCData server side of the client: records requests, answers with [answer]. */
     private inner class FakePeer(override val userId: String = "sip:alice@mcx.test") : FdPeer {
         override val clientId = "urn:uuid:00000000-0000-0000-0000-00000000000a"
+        override var psi: String? = "sip:mcdata@mcx.test"
         val sent = mutableListOf<List<Part>>()
         var answer: (List<Part>) -> SipResponse = { SipResponse(202, "Accepted") }
         var token = "t1"
         var refreshes = 0
         var policies = mapOf<String, GroupFdPolicy>()
         override suspend fun send(parts: List<Part>): SipResponse { sent += parts; log += "sip"; return answer(parts) }
+        val headers = mutableListOf<List<Pair<String, String>>>()
+        override suspend fun send(parts: List<Part>, headers: List<Pair<String, String>>): SipResponse { this.headers += headers; return send(parts) }
         override fun token() = token
         override suspend fun refreshToken() { refreshes++; token = "t${refreshes + 1}" }
         override fun groupPolicy(group: String) = policies[group]
         override fun event(text: String) {}
+        var alias: String? = null
+        override fun aliasInUse() = alias
+        var refusal: String? = null
+        override suspend fun transmission(target: String, group: Boolean, size: Long) { refusal?.let { throw SdsError(it) } }
     }
 
     /** The media storage function behind the proxy, on disk. */
@@ -131,6 +138,27 @@ class FdServiceTest {
         assertEquals(metadata.size, offered.size); assertEquals(metadata.sha256, offered.sha256)
         assertEquals(sent.id, request.messageId.toString())
         assertEquals("Bearer t1", files.tokens.single())
+    }
+
+    @Test fun theFdRequestNamesTheFunctionalAliasInUse() = runTest {
+        val peer = FakePeer().apply { alias = "sip:front-desk.fa@mcx.test" }; val files = FakeFiles()
+        val fd = service(backgroundScope, peer, files)
+        val (file, metadata) = staged()
+        fd.send("sip:bob@mcx.test", false, file, metadata)
+        // TS 24.282 §10.2.4.2.1 1)b)ii) (§22): <functional-alias-URI> while the alias is active; the client ID.
+        val info = McdataInfo.parse(peer.sent.single().first { it.mediaType == McdataInfo.CONTENT_TYPE }.text)
+        assertEquals("sip:front-desk.fa@mcx.test", info.functionalAlias)
+        assertEquals(peer.clientId, info.clientId)
+    }
+
+    @Test fun aFileTheTransmissionControlRefusesIsNotUploaded() = runTest {
+        val peer = FakePeer().apply { refusal = "FD larger than <max-data-size-fd-bytes> 100 (TS 24.282 §11.1 4))" }; val files = FakeFiles()
+        val fd = service(backgroundScope, peer, files)
+        val (file, metadata) = staged()
+        // TS 24.282 §10.2.1.1 1) -> §11.1: nothing uploaded, no FD request.
+        assertTrue(runCatching { fd.send("sip:bob@mcx.test", false, file, metadata) }.exceptionOrNull() is FdError)
+        assertEquals(0, files.uploads)
+        assertTrue(peer.sent.isEmpty())
     }
 
     @Test fun groupOfferUsesGroupAndClientId() = runTest {
@@ -371,5 +399,78 @@ class FdServiceTest {
         assertEquals("_etc_passwd", FdService.localName("/etc/passwd"))
         assertEquals("日本.pdf", FdService.localName("日本.pdf"))
         assertEquals("file", FdService.localName(".."))
+    }
+
+    // Release and extension (TS 24.282 §6.2.2.4, §13.2.4.5, §13.2.6.3).
+
+    @Test fun ownDistributionIsTerminatedAndTheServersAnswerRecorded() = runTest {
+        val peer = FakePeer(); val files = FakeFiles()
+        val fd = service(backgroundScope, peer, files)
+        val (file, metadata) = staged()
+        val sent = fd.send("sip:bob@mcx.test", false, file, metadata)
+        fd.terminate(sent.id, "cancel")
+        val parts = peer.sent.last()
+        val info = McdataInfo.parse(parts.single { it.mediaType == McdataInfo.CONTENT_TYPE }.text)
+        assertEquals("one-to-one-fd", info.requestType)
+        assertEquals(peer.clientId, info.clientId)
+        assertEquals(listOf("sip:bob@mcx.test"), ResourceLists.parse(parts.single { it.mediaType == ResourceLists.CONTENT_TYPE }.text))
+        val termination = FdHttpTermination.decode(signalling(parts))
+        assertEquals(TerminationType.REQUEST, termination.type)
+        assertEquals(sent.url, termination.fileUrl)
+        assertEquals(sent.id, termination.messageId.toString())
+        // TS 24.282 §6.3.6.1: the server's answer.
+        fd.receive(request(listOf(Part(McdataService.SIGNALLING, FdHttpTermination(UUID.fromString(sent.conversationId),
+            UUID.fromString(sent.id), TerminationType.RESPONSE, releaseSucceeded = true).encode()))))
+        assertEquals("terminated", fd.record(sent.id)!!.release)
+    }
+
+    @Test fun extensionRequestWithoutAStoredControllerPsiNamesTheMcdataPsi() = runTest {
+        // TS 24.282 §13.2.4.5.2.2 3)a): <mcdata-controller-psi> is mandatory; no intent stored one, so the MCData PSI.
+        val peer = FakePeer(); val files = FakeFiles()
+        val fd = service(backgroundScope, peer, files)
+        val (file, metadata) = staged()
+        val sent = fd.send("sip:bob@mcx.test", false, file, metadata)
+        fd.terminate(sent.id, "extend")
+        val info = McdataInfo.parse(peer.sent.last().single { it.mediaType == McdataInfo.CONTENT_TYPE }.text)
+        assertEquals("sip:mcdata@mcx.test", info.controllerPsi)
+        assertEquals("one-to-one-fd", info.requestType)
+        assertEquals(TerminationType.EXTENSION_REQUEST, FdHttpTermination.decode(signalling(peer.sent.last())).type)
+        // An intent without <mcdata-controller-psi> leaves the fallback; other terminations carry no controller PSI.
+        fd.receive(request(listOf(Part(McdataInfo.CONTENT_TYPE, McdataInfo(requestUri = "sip:alice@mcx.test").encode().toByteArray()),
+            Part(McdataService.SIGNALLING, FdHttpTermination(UUID.fromString(sent.conversationId), UUID.fromString(sent.id),
+                TerminationType.INTENT_TO_RELEASE).encode()))))
+        fd.terminate(sent.id, "extend")
+        assertEquals("sip:mcdata@mcx.test",
+            McdataInfo.parse(peer.sent.last().single { it.mediaType == McdataInfo.CONTENT_TYPE }.text).controllerPsi)
+        fd.terminate(sent.id, "cancel")
+        assertEquals(null, McdataInfo.parse(peer.sent.last().single { it.mediaType == McdataInfo.CONTENT_TYPE }.text).controllerPsi)
+    }
+
+    @Test fun intentToReleaseThenExtensionRequestWithTheControllerPsi() = runTest {
+        val peer = FakePeer(); val files = FakeFiles()
+        val fd = service(backgroundScope, peer, files)
+        val (file, metadata) = staged()
+        val sent = fd.send("sip:ops@mcx.test", true, file, metadata)
+        fd.receive(request(listOf(Part(McdataInfo.CONTENT_TYPE, McdataInfo(controllerPsi = "sip:controller@mcx.test").encode().toByteArray()),
+            Part(McdataService.SIGNALLING, FdHttpTermination(UUID.fromString(sent.conversationId), UUID.fromString(sent.id),
+                TerminationType.INTENT_TO_RELEASE).encode()))))
+        assertEquals("release pending", fd.record(sent.id)!!.release)
+        fd.terminate(sent.id, "extend")
+        val info = McdataInfo.parse(peer.sent.last().single { it.mediaType == McdataInfo.CONTENT_TYPE }.text)
+        assertEquals("sip:controller@mcx.test", info.controllerPsi)
+        assertEquals("group-fd", info.requestType)
+        assertEquals(TerminationType.EXTENSION_REQUEST, FdHttpTermination.decode(signalling(peer.sent.last())).type)
+        // The authorised user's intent to release carries the Reason (§13.2.6.3.2.1 step 3); its extension response the answer.
+        fd.terminate(sent.id, "release-intent", reason = "quota")
+        assertEquals(listOf("Reason" to "SIP;cause=200;text=\"quota\""), peer.headers.last())
+        fd.terminate(sent.id, "extension-response", accept = false)
+        assertEquals(false, FdHttpTermination.decode(signalling(peer.sent.last())).extensionAccepted)
+    }
+
+    @Test fun fdHttpTerminationCodec() {
+        val m = FdHttpTermination(UUID.randomUUID(), UUID.randomUUID(), TerminationType.EXTENSION_RESPONSE, extensionAccepted = true,
+            fileUrl = "https://x/f")
+        assertEquals(m, FdHttpTermination.decode(m.encode()))
+        assertEquals(0x0d, m.encode()[0].toInt())
     }
 }

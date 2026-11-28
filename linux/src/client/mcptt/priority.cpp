@@ -346,8 +346,9 @@ void Client::change_private_priority(bool enable, bool with_alert, const std::st
   }
   priority_pending_ = true;
   try {
+    // TS 24.379 clause 11.1.1.2.1.5 step 3 and its NOTE: in the call's dialog or the pre-established session's.
     sip_.reinvite(
-        dialog_, offer_media(), parts,
+        call_reinvite_dialog(), call_reinvite_offer(), parts,
         [this, enable, previous_mpea, implicit](const SipResponse &response) {
           if (response.status_code < 200) return;
           if (implicit) schedule([this, code = response.status_code] { upgrade_implicit_answered(code); });
@@ -461,6 +462,20 @@ void Client::change_priority(bool emergency, bool enabled, const std::string &ot
         update_priority(upgraded, std::nullopt);
         if (!emergency) imminent_group_states_[active_group()] = "MIG 2: in-progress";
       }
+      // TS 24.379 clauses 10.1.1.2.1.4 2) and 10.1.1.2.1.5 2) (chat: 10.1.2.2.1.4, 10.1.2.2.1.5): a 2xx to the
+      // re-INVITE cancelling the call's emergency or imminent peril sets "MEG 1: no-emergency" or "MIG 1:
+      // no-imminent-peril", whatever the response's mcptt-info says (it need not carry <emergency-ind> or
+      // <imminentperil-ind>). The call is a normal call again, which its Floor Requests and Floor Releases say (TS
+      // 24.380 clause 8.2.3.15). Out of a call (clause 12.1.1.5) the 2xx does not: the server's MESSAGE does.
+      if (active && !enabled && response.status_code < 300) {
+        McpttInfo cancelled;
+        if (emergency)
+          cancelled.emergency = false;
+        else
+          cancelled.imminent_peril = false;
+        update_priority(cancelled, std::nullopt);
+        if (!emergency) imminent_group_states_[active_group()] = "MIG 1: no-imminent-peril";
+      }
       priority_response(response);
       if (response.status_code >= 300) failure("priority update: " + std::to_string(response.status_code));
     };
@@ -474,7 +489,9 @@ void Client::change_priority(bool emergency, bool enabled, const std::string &ot
       })
                            : std::function<void(const SipResponse &)>(completed);
       try {
-        sip_.reinvite(dialog_, offer_media(), info_parts(info), done, headers);
+        // TS 24.379 clauses 10.1.1.2.1.3 steps 5, 6 and 10.1.1.2.1.4 steps 6, 7: in the call's dialog or the
+        // pre-established session's.
+        sip_.reinvite(call_reinvite_dialog(), call_reinvite_offer(), info_parts(info), done, headers);
       } catch (...) {
         if (implicit) upgrade_implicit_answered(500);
         local_.implicit_request = false;

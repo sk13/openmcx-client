@@ -103,8 +103,11 @@ void Client::failure(const std::string &what) {
 
 //------------------------------------------------------------------------------
 // TS 24.379 clause 7.2.2 (poc-settings and the CSK upload of TS 33.180 clause 5.4) or clause 9.2.1.2 (the
-// affiliation pidf+xml): the multipart body of the service authorisation or affiliation SIP PUBLISH.
-std::pair<std::string, std::string> Client::publish_body(bool affiliation) {
+// affiliation pidf+xml): the multipart body of the service authorisation or affiliation SIP PUBLISH. withdraw: the
+// PUBLISH with Expires 0 that removes the affiliation (clause 9.2.1.2 4), the user no longer interested in any group):
+// its PIDF has an empty <status> (NOTE 2 makes the PIDF optional; TS 37.579-2 tables 5.3.3.3 and 6.1.4.2.3.3 have it
+// present and empty), not the groups being left.
+std::pair<std::string, std::string> Client::publish_body(bool affiliation, bool withdraw) {
   McpttInfo info;
   info.client_id = client_id();
   info.access_token = token_;
@@ -115,8 +118,10 @@ std::pair<std::string, std::string> Client::publish_body(bool affiliation) {
     // TS 24.379 clause 9.2.1.2: the selected group (unless the user is no longer interested in it, left_selected_)
     // and the groups monitored besides it.
     std::vector<std::string> groups;
-    if (!left_selected_) groups.push_back(group());
-    groups.insert(groups.end(), monitored_groups_.begin(), monitored_groups_.end());
+    if (!withdraw) {
+      if (!left_selected_) groups.push_back(group());
+      groups.insert(groups.end(), monitored_groups_.begin(), monitored_groups_.end());
+    }
     Affiliation request{user(), client_id(), random_id(), groups, {}};
     mcptt_sent_pid_ = request.publication_id; // TS 24.379 clause 10.1.4.2.2 step 1 c): the NOTIFY naming it
     parts.push_back({"application/pidf+xml", affiliation_xml(request, false)});
@@ -507,6 +512,7 @@ void Client::subscribe_conference(bool force) {
   McpttInfo info;
   info.request_uri = active_group();
   info.client_id = client_id();
+  conference_group_ = info.request_uri;
   conference_version_.reset();
   conference_members_.clear();
   const auto generation = ++conference_generation_;
@@ -532,18 +538,29 @@ void Client::subscribe_conference(bool force) {
 //------------------------------------------------------------------------------
 // TS 24.379 clause 10.1.3.2 with RFC 6665 section 4.1.2.3: "conference-unsubscribe" ends the conference event
 // subscription by an in-dialog SUBSCRIBE with Expires 0; the final NOTIFY is still answered (retired_conferences_).
+// The termination is "according to IETF RFC 6665", which needs only Expires 0 in the dialog; the SUBSCRIBE also
+// repeats the Accept-Contact and the mcptt-info body of the subscription (items 4) and 8)), as TS 37.579-2 table
+// 6.1.3.1.3.3-14 has it. A final response other than 2xx leaves the server's subscription in place: reported.
 void Client::unsubscribe_conference() {
   if (conference_subscription_.empty()) throw std::runtime_error("no conference event subscription");
   const auto dialog = conference_subscription_;
-  sip_.request_in_dialog(dialog, "SUBSCRIBE", {}, {},
-                         {{"Event", "conference"},
-                          {"Expires", "0"},
-                          {"Accept", "application/conference-info+xml"},
-                          {"P-Preferred-Service", "urn:urn-7:3gpp-service.ims.icsi.mcptt"}},
-                         [this](const SipResponse &response) {
-                           if (response.status_code >= 200)
-                             event("conference_unsubscribed", {{"status", response.status_code}});
-                         });
+  McpttInfo info;
+  info.request_uri = conference_group_.empty() ? active_group() : conference_group_;
+  info.client_id = client_id();
+  sip_.request_in_dialog(
+      dialog, "SUBSCRIBE", "application/vnd.3gpp.mcptt-info+xml", mcptt_info_xml(info),
+      {{"Event", "conference"},
+       {"Expires", "0"},
+       {"Accept", "application/conference-info+xml"},
+       {"P-Preferred-Service", "urn:urn-7:3gpp-service.ims.icsi.mcptt"},
+       {"Accept-Contact", "*;+g.3gpp.mcptt;require;explicit"},
+       {"Accept-Contact", "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mcptt\";require;explicit"}},
+      [this](const SipResponse &response) {
+        if (response.status_code < 200) return;
+        status_["conference_unsubscribe_status"] = response.status_code;
+        event("conference_unsubscribed", {{"status", response.status_code}});
+        if (response.status_code >= 300) failure("conference unsubscribe: " + std::to_string(response.status_code));
+      });
   if (retired_conferences_.size() >= 32) retired_conferences_.erase(retired_conferences_.begin());
   retired_conferences_[dialog] = session_uri_;
   conference_subscription_.clear();

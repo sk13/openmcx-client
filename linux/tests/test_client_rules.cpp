@@ -470,6 +470,29 @@ void test_call_key_group() {
 }
 
 //------------------------------------------------------------------------------
+// TS 24.281 clauses 22.2.2.1.1 (2xx step 3), 22.2.2.1.2 step 8 and 22.1 with TS 33.180 clause 5.7: the preconfigured
+// group keying a protected MCVideo ad hoc group call, and the groups subscribed to for it from the start.
+void test_adhoc_security() {
+  using mcx::client_rules::adhoc_key_group;
+  using mcx::client_rules::mcvideo_adhoc_security_groups;
+  check(adhoc_key_group("sip:adhoc-security@x", "") == "sip:adhoc-security@x", "the received preconfigured group");
+  check(adhoc_key_group(" sip:adhoc-security@x\n", "") == "sip:adhoc-security@x", "surrounding white space dropped");
+  check(adhoc_key_group("sip:new@x", "sip:old@x") == "sip:new@x", "a newly received group replaces the kept one");
+  check(adhoc_key_group("", "sip:old@x") == "sip:old@x", "a re-INVITE without the element keeps the call's group");
+  check(adhoc_key_group("", "").empty(), "no <preconfigured-group-id>: not keyable (488, or the call ends)");
+  check(adhoc_key_group("adhoc-security", "").empty(), "a <preconfigured-group-id> that is no SIP URI: not keyable");
+  check(adhoc_key_group("sips:s@x", "") == "sips:s@x", "a SIPS URI");
+  using Groups = std::optional<std::vector<std::string>>;
+  check(mcvideo_adhoc_security_groups(Groups{{"sip:v@x"}}, Groups{{"sip:p@x"}}) == std::vector<std::string>{"sip:v@x"},
+        "mcvideo.adhoc_security_groups first");
+  check(mcvideo_adhoc_security_groups(Groups{std::vector<std::string>{}}, Groups{{"sip:p@x"}}).empty(),
+        "an empty mcvideo.adhoc_security_groups subscribes to none");
+  check(mcvideo_adhoc_security_groups(std::nullopt, Groups{{"sip:p@x"}}) == std::vector<std::string>{"sip:p@x"},
+        "without it, mcptt.adhoc_security_groups");
+  check(mcvideo_adhoc_security_groups(std::nullopt, std::nullopt).empty(), "neither configured: none");
+}
+
+//------------------------------------------------------------------------------
 // TS 33.180 annex E.6.10: an MCData PCK context ends at the earlier of the local lifetime and the PCK's own Expiry
 // time (0: none); with an Expiry time 1 s ahead it is usable now and gone at that time (expire_data_keys drops a
 // context once its end is reached).
@@ -588,6 +611,21 @@ void test_reg_event_rules() {
   check(!own_reg_contact("sip:client-c@client-d:5060", "new-call", self, "new-call"),
         "another address is not this client's whatever its callid");
 
+  // RFC 3680 section 5.1: the binding's state from before the current REGISTER under the same Call-ID (BR-04: the
+  // first NOTIFY after log-on still lists the binding the log-off removed, cseq 2, the registration's CSeq being 6).
+  using mcx::client_rules::stale_reg_contact;
+  check(stale_reg_contact("call", 2, "call", 6), "a lower cseq under the same Call-ID is stale");
+  check(!stale_reg_contact("call", 6, "call", 6), "the current registration's cseq is not stale");
+  check(!stale_reg_contact("call", 7, "call", 6), "a later cseq (a network deregistration) is not stale");
+  check(!stale_reg_contact("other", 2, "call", 6), "CSeq numbers of another Call-ID do not compare");
+  check(!stale_reg_contact("", 2, "call", 6), "without callid the cseq does not compare");
+  check(!stale_reg_contact("call", std::nullopt, "call", 6), "without cseq nothing is stale");
+  check(!stale_reg_contact("call", 2, "call", 0), "before a registration's CSeq is known nothing is stale");
+  using mcx::client_rules::cseq_number;
+  check(cseq_number("6 REGISTER") == 6 && cseq_number(" 28845 REGISTER") == 28845, "CSeq sequence number");
+  check(cseq_number("") == 0 && cseq_number("REGISTER") == 0 && cseq_number("12x REGISTER") == 0,
+        "no sequence number in a malformed CSeq");
+
   // RFC 6665 section 4.1.3: a reg NOTIFY on a dialog other than the current subscription's is answered 481.
   using mcx::client_rules::classify_reg_notify;
   using mcx::client_rules::RegNotify;
@@ -620,10 +658,102 @@ static void test_sds_payloads() {
   check(hex_text(location_payload("-45,-90")) == "c00000c00000", "45 S 90 W");
 }
 
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 18.3.2.1 step 9, 9.2.5.2.1.1, 9.2.5.4.1.2 and 18.3.1.1: the MCData-Info and SDP parts of a
+// pre-established session.
+void test_pre_established_parts() {
+  using mcx::client_rules::mcdata_communication_state;
+  using mcx::client_rules::mcdata_info_with_any_ext;
+  const std::string bare = "<mcdatainfo><mcdata-Params><request-type>x</request-type></mcdata-Params></mcdatainfo>";
+  const auto added = mcdata_info_with_any_ext(bare, "<pre-established-session-ind>true</pre-established-session-ind>");
+  check(added == "<mcdatainfo><mcdata-Params><request-type>x</request-type><anyExt><pre-established-session-ind>true"
+                 "</pre-established-session-ind></anyExt></mcdata-Params></mcdatainfo>",
+        "anyExt added to mcdata-Params");
+  const auto again = mcdata_info_with_any_ext(added, "<a>1</a>");
+  check(again.find("</pre-established-session-ind><a>1</a></anyExt>") != std::string::npos, "into the existing anyExt");
+  bool threw = false;
+  try {
+    (void)mcdata_info_with_any_ext("<mcdatainfo/>", "<a/>");
+  } catch (const std::invalid_argument &) {
+    threw = true;
+  }
+  check(threw, "no mcdata-Params refused");
+  const std::string trimmed = "<anyExt><mcdata-communication-state> establish-success </mcdata-communication-state>";
+  check(mcdata_communication_state(trimmed) == "establish-success", "communication state read, trimmed");
+  check(mcdata_communication_state("<m:mcdata-communication-state>terminate request</m:mcdata-communication-state>") ==
+            "terminate-request",
+        "TS 37.579-7 spelling read as terminate-request");
+  check(mcdata_communication_state("<anyExt/>").empty(), "no communication state");
+  const auto ice = mcx::client_rules::msrp_ice_attributes("uf", "pw", "10.0.0.1", 4000);
+  check(ice == "a=ice-ufrag:uf\r\na=ice-pwd:pw\r\na=candidate:1 1 TCP 2124414975 10.0.0.1 4000 typ host tcptype "
+               "passive\r\n",
+        "ICE attributes of the MSRP listener");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 6.2.8.1.16, 9.2.5.2.1.1 (re-INVITE 3)), 6.2.8.1.17 and 6.2.8.1.18: the priority states of a
+// communication over a pre-established session, granted and released.
+void test_pre_priority_states() {
+  using mcx::client_rules::McdataPriorityStates;
+  using mcx::client_rules::pre_group_priority_granted;
+  using mcx::client_rules::pre_private_priority_granted;
+  using mcx::client_rules::priority_released;
+  // an emergency group request with an alert: MDEGC 2, MDEG 4, MDEA 2
+  McdataPriorityStates requested{4, 2, 2, 1, 1, 1, 1};
+  auto s = pre_group_priority_granted(requested, std::nullopt, std::nullopt, std::nullopt);
+  check(s.mdeg == 2 && s.mdegc == 3 && s.mdea == 3, "6.2.8.1.16 1)a), 1)b)i): no indications grant the emergency");
+  s = pre_group_priority_granted(requested, true, std::nullopt, false);
+  check(s.mdeg == 2 && s.mdegc == 3 && s.mdea == 1, "6.2.8.1.16 1)b)ii): <alert-ind> false: MDEA 1");
+  s = pre_group_priority_granted(requested, false, std::nullopt, std::nullopt);
+  check(s.mdeg == 4 && s.mdegc == 2, "6.2.8.1.16 1)a): <emergency-ind> false grants nothing");
+  s = pre_group_priority_granted(requested, true, false, std::nullopt);
+  check(s.mdeg == 4 && s.mdegc == 2, "6.2.8.1.16 1)a): an <imminentperil-ind> present grants nothing");
+  // an imminent peril group request: MDIGC 2, MDIG 4
+  const McdataPriorityStates imminent{1, 1, 1, 4, 2, 1, 1};
+  s = pre_group_priority_granted(imminent, std::nullopt, std::nullopt, std::nullopt);
+  check(s.mdig == 2 && s.mdigc == 3 && s.mdeg == 1, "6.2.8.1.16 2)a): MDIG 2, MDIGC 3");
+  s = pre_group_priority_granted(imminent, std::nullopt, true, std::nullopt);
+  check(s.mdig == 2 && s.mdigc == 3, "6.2.8.1.16 2)a): <imminentperil-ind> true");
+  s = pre_group_priority_granted(imminent, true, false, std::nullopt);
+  check(s.mdeg == 2 && s.mdigc == 1 && s.mdig == 1, "6.2.8.1.16 2)b): at the group's emergency level");
+  // one-to-one: MDEPC 2, MDEPP 3
+  const McdataPriorityStates priv{1, 1, 1, 1, 1, 2, 3};
+  s = pre_private_priority_granted(priv);
+  check(s.mdepc == 3 && s.mdepp == 2, "9.2.5.2.1.1 3)a): MDEPP 2, MDEPC 3");
+  check(pre_private_priority_granted({}).mdepc == 1, "9.2.5.2.1.1 3)a): no request, no grant");
+  // released while still being established
+  s = priority_released(requested);
+  check(s.mdegc == 1 && s.mdeg == 1 && s.mdea == 1, "6.2.8.1.17 1): MDEGC 1, MDEG 1, MDEA 1");
+  s = priority_released(imminent);
+  check(s.mdigc == 1 && s.mdig == 1, "6.2.8.1.17 2): MDIGC 1, MDIG 1");
+  s = priority_released(priv);
+  check(s.mdepc == 1 && s.mdepp == 1, "6.2.8.1.18 1): MDEPC 1, MDEPP 1");
+  // released once granted: the group's in-progress state stays
+  s = priority_released(pre_group_priority_granted(requested, true, std::nullopt, true));
+  check(s.mdeg == 2 && s.mdegc == 1 && s.mdea == 3, "a granted emergency: MDEG 2 and the alert kept");
+  s = priority_released(pre_group_priority_granted(imminent, std::nullopt, true, std::nullopt));
+  check(s.mdig == 2 && s.mdigc == 1, "a granted imminent peril: MDIG 2 kept");
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 13.2.4.5.2.2 3)a) and 4): the <mcdata-controller-psi> of an FD HTTP TERMINATION message.
+void test_extension_controller_psi() {
+  using mcx::client_rules::extension_controller_psi;
+  const std::string psi = "sip:mcdata-server@example.org";
+  const std::string controller = "sip:mcdata-controller@example.org";
+  check(extension_controller_psi(true, controller, psi) == controller,
+        "13.2.4.5.2.2 3)a): the PSI stored from the intent to release wins");
+  check(extension_controller_psi(true, "", psi) == psi,
+        "13.2.4.5.2.2 3)a), 4): none stored, the MCData PSI the MESSAGE goes to");
+  check(extension_controller_psi(false, controller, psi).empty(), "a release or cancel carries no controller PSI");
+  check(extension_controller_psi(false, "", psi).empty(), "a release without a stored PSI carries none either");
+}
+
 int main() {
   test_call_floor_ssrcs();
   test_floor_multiplexing();
   test_call_key_group();
+  test_adhoc_security();
   test_data_pck_end();
   test_notifiers();
   test_has_warning();
@@ -644,6 +774,9 @@ int main() {
   test_reg_event_rules();
   test_mc_priorities();
   test_sds_payloads();
+  test_pre_established_parts();
+  test_pre_priority_states();
+  test_extension_controller_psi();
   if (failures) std::fprintf(stderr, "%d check(s) failed\n", failures);
   return failures ? 1 : 0;
 }

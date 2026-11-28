@@ -49,6 +49,23 @@ class PhoneRoles(unittest.TestCase):
                 androidlab.RUNS = old
 
 
+class Down(unittest.TestCase):
+    def test_down_removes_the_run_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = androidlab.RUNS
+            androidlab.RUNS = Path(d)
+            try:
+                lab = Path(d) / "x1"
+                (lab / "fixture" / "artifacts").mkdir(parents=True)
+                (lab / "lab.json").write_text(json.dumps({"clients": [], "server_image": "none"}))
+                (lab / "android-scenarios.json").write_text("[]")
+                androidlab.remove_run("x1")
+                self.assertFalse(lab.exists())
+                androidlab.remove_run("x1")  # already gone: nothing to do
+            finally:
+                androidlab.RUNS = old
+
+
 class FileDistributionSettings(unittest.TestCase):
     def test_lab_fd_policy_is_consistent(self):
         with tempfile.TemporaryDirectory() as d:
@@ -85,6 +102,31 @@ class FileDistributionSettings(unittest.TestCase):
             self.assertEqual(compose["services"]["content-server"]["command"][-2:], ["--file-transfer-timeout-ms", "900000"])
             self.assertEqual(fd["content_server"], "https://http-proxy:8443/content")
             self.assertEqual((fd["service_max_bytes"], fd["user_max_bytes"]), (100_000_000, 100_000_000))
+
+
+class AdhocSecurityGroups(unittest.TestCase):
+    """TS 24.379 clause 17.1 / TS 24.281 clause 22.1: the reference client's mcptt.adhoc_security_groups (the fixture's
+    --protected --adhoc) reach the phone's MCPTT and MCVideo configuration; a lab without them provisions none."""
+
+    def ref(self, **mcptt):
+        return {"sip": {"identity": "sip:alice@mcx.test", "username": "alice", "password": "p"},
+                "oauth": {"issuer": "https://idms", "client_id": "c", "redirect_uri": "http://127.0.0.1/cb"},
+                "endpoints": {"cms": "https://cms", "gms": "https://gms"},
+                "mcptt": {"client_id": "urn:uuid:1", "user_id": "sip:alice.mcptt@mcx.test", "service_uri": "sip:mcptt@mcx.test",
+                          "group_id": "sip:operations@mcx.test", **mcptt},
+                "mcvideo": {"user_id": "sip:alice.mcvideo@mcx.test", "service_uri": "sip:mcvideo@mcx.test",
+                            "group_id": "sip:operations@mcx.test"}}
+
+    def test_groups_provisioned_for_both_services(self):
+        bundle = androidlab.provisioning(self.ref(adhoc_security_groups=["sip:adhoc-security@mcx.test"]),
+                                         {"domain": "mcx.test"}, "client-a", True)
+        self.assertEqual(bundle["mcptt"]["adhoc_security_groups"], ["sip:adhoc-security@mcx.test"])
+        self.assertEqual(bundle["mcvideo"]["adhoc_security_groups"], ["sip:adhoc-security@mcx.test"])
+
+    def test_none_without_them(self):
+        bundle = androidlab.provisioning(self.ref(), {"domain": "mcx.test"}, "client-a", True)
+        self.assertNotIn("adhoc_security_groups", bundle["mcptt"])
+        self.assertNotIn("adhoc_security_groups", bundle["mcvideo"])
 
 
 if __name__ == "__main__":

@@ -43,14 +43,24 @@ class FdError(message: String) : Exception(message)
 interface FdPeer {
     val userId: String
     val clientId: String
+    /** The MCData PSI the client sends its FD MESSAGEs to (TS 24.282 §6.2.4.1); null when unknown. */
+    val psi: String? get() = null
     /** Send a MESSAGE with the FD feature tag and ICSI (TS 24.282 §6.2.4.1) to the MCData PSI. */
     suspend fun send(parts: List<Part>): SipResponse
+    /** [send] with header fields (a Reason, TS 24.282 §13.2.6.3.2.1 step 3). */
+    suspend fun send(parts: List<Part>, headers: List<Pair<String, String>>): SipResponse = send(parts)
     fun token(): String?
     suspend fun refreshToken()
     fun groupPolicy(group: String): GroupFdPolicy?
     fun event(text: String)
     /** TS 24.282 §6.6.3 with TS 33.180 §8.3: end-to-end payload protection, null without. */
     val protection: McdataProtection? get() = null
+    /** TS 24.282 §10.2.4.2.1 1)b)ii): the functional alias in use, while it is active for the user; null otherwise. */
+    fun aliasInUse(): String? = null
+    /** [aliasInUse], once the activation of the alias the user chose to use is in (McxClient.awaitAlias). */
+    suspend fun awaitAlias(): String? = aliasInUse()
+    /** TS 24.282 §10.2.1.1 1) -> §11.1 (McdataTransmission.fd): throws when the file of [size] octets is not allowed. */
+    suspend fun transmission(target: String, group: Boolean, size: Long) {}
 }
 
 /** [FdPeer] on the running [McxClient]. */
@@ -58,13 +68,17 @@ class ClientFdPeer(private val client: McxClient) : FdPeer {
     private val mcdata = client.config.mcdata!!
     override val userId get() = mcdata.userId
     override val clientId get() = client.config.clientId
-    override suspend fun send(parts: List<Part>): SipResponse {
+    override val psi get() = mcdata.psi
+    override suspend fun send(parts: List<Part>): SipResponse = send(parts, emptyList())
+    override suspend fun send(parts: List<Part>, headers: List<Pair<String, String>>): SipResponse {
         val request = client.ua.newRequest("MESSAGE", mcdata.psi, NameAddr(mcdata.psi))
-        val (type, body) = Multipart.encode(parts)
+        // TS 24.282 §6.4: one MIME body goes as it is, several in a multipart/mixed (the msf-disc-req has one).
+        val (type, body) = if (parts.size == 1) parts[0].contentType to parts[0].content else Multipart.encode(parts)
         request.headers.add("Accept-Contact", "*;+g.3gpp.mcdata.fd;require;explicit")
             .add("Accept-Contact", "*;+g.3gpp.icsi-ref=\"${Icsi.encoded(Icsi.MCDATA_FD)}\";require;explicit")
             .add("P-Preferred-Service", Icsi.MCDATA_FD)
             .add("Content-Type", type)
+        headers.forEach { (k, v) -> request.headers.add(k, v) }
         return client.ua.send(SipRequest(request.method, request.uri, request.headers, body))
     }
     override fun token() = client.tokens?.accessToken
@@ -72,6 +86,9 @@ class ClientFdPeer(private val client: McxClient) : FdPeer {
     override fun groupPolicy(group: String) = client.groupDocuments[group]?.fd
     override fun event(text: String) = client.event("fd: $text")
     override val protection get() = client.mcdataProtection
+    override fun aliasInUse() = client.aliasesOf(org.openmcx.client.body.McService.MCDATA).value.let { a -> a.inUse?.takeIf { it in a.active } }
+    override suspend fun awaitAlias() = client.awaitAlias(org.openmcx.client.body.McService.MCDATA)
+    override suspend fun transmission(target: String, group: Boolean, size: Long) = McdataTransmission.fd(client, target, group, size)
 }
 
 /**
@@ -208,7 +225,10 @@ class FdService(
                 if (policy != null) FdPolicy.requireAllowed(config, policy, size)
                 else FdPolicy.requireAllowed(config.copy(userMaxBytes = null), null, size)
             } else FdPolicy.requireAllowed(config, null, size)
+            // TS 24.282 §10.2.1.1 1) -> §11.1 2), 4), 6), §10.2.4.2.1 3)a): the service configuration and group document.
+            peer.transmission(target, group, size)
         } catch (e: IllegalArgumentException) { throw FdError(e.message ?: "file not allowed") }
+        catch (e: SdsError) { throw FdError(e.message ?: "file not allowed") }
         val record = FdRecord(UUID.randomUUID().toString(), UUID.randomUUID().toString(), FdDirection.OUTGOING, target,
             if (group) target else null, metadata, localPath = file.path, state = FdState.STAGED, completionRequested = true)
         add(record)
@@ -246,8 +266,11 @@ class FdService(
             update(record.id) { it.copy(state = FdState.SENDING, url = url, transferred = size) }
             val signalling = FdSignalling(clock(), UUID.fromString(record.conversationId), UUID.fromString(record.id), url,
                 described.encode(), completionRequested = true)
-            val requestInfo = if (group) McdataInfo(requestType = "group-fd", requestUri = target, clientId = peer.clientId)
-            else McdataInfo(requestType = "one-to-one-fd")
+            // TS 24.282 §10.2.4.2.1 1)b)ii) (§22): the functional alias in use, while active; the client ID (as Linux).
+            // An alias chosen while its activation is awaited is waited for (TS 37.579-7 6.2.14 step 2).
+            val alias = peer.awaitAlias()
+            val requestInfo = if (group) McdataInfo(requestType = "group-fd", requestUri = target, clientId = peer.clientId, functionalAlias = alias)
+            else McdataInfo(requestType = "one-to-one-fd", clientId = peer.clientId, functionalAlias = alias)
             val parts = mutableListOf(Part(McdataInfo.CONTENT_TYPE, requestInfo.encode().toByteArray()))
             if (!group) parts += Part(ResourceLists.CONTENT_TYPE, ResourceLists.encode(listOf(target)).toByteArray())
             parts += Part(McdataService.SIGNALLING, signalling.encode())
@@ -343,6 +366,71 @@ class FdService(
         return rejected
     }
 
+    // Release and extension (TS 24.282 §6.2.2.4, §13.2.1.2, §13.2.4.5, §13.2.5.3, §13.2.6.3).
+
+    /**
+     * An FD HTTP TERMINATION to the MCData server for the distribution [id]: "cancel" this user's own (§6.2.2.4,
+     * termination request), "release" another user's as an authorised user (§13.2.5.3.2.1), "extend" after the server's
+     * intent to release (§13.2.4.5.2.2, with the stored controller PSI), "release-intent" as the authorised user
+     * (§13.2.6.3.2.1, with the Reason), "extension-response" to the originator's extension request (§13.2.6.3.2.3,
+     * [accept]). mcdata-info carries the client ID, and the request type of an own distribution or the originator
+     * (§13.2.1.2 step 5a); a one-to-one release names the recipient in resource-lists (§13.2.2.3.2.1.1 2)a)).
+     */
+    suspend fun terminate(id: String, action: String, accept: Boolean? = null, reason: String? = null): FdRecord {
+        val record = record(id) ?: throw FdError("no file distribution $id")
+        val type = when (action) {
+            "cancel" -> TerminationType.REQUEST
+            "release" -> TerminationType.AUTHORISED_USER_REQUEST
+            "extend" -> TerminationType.EXTENSION_REQUEST
+            "release-intent" -> TerminationType.INTENT_TO_RELEASE
+            "extension-response" -> TerminationType.EXTENSION_RESPONSE
+            else -> throw FdError("action: cancel, release, extend, release-intent or extension-response")
+        }
+        if (type == TerminationType.EXTENSION_RESPONSE && accept == null) throw FdError("accept or reject the extension")
+        val own = !record.incoming
+        val message = FdHttpTermination(UUID.fromString(record.conversationId), UUID.fromString(record.id), type,
+            extensionAccepted = if (type == TerminationType.EXTENSION_RESPONSE) accept else null, fileUrl = record.url)
+        val info = McdataInfo(
+            requestType = if (own) (if (record.group != null) "group-fd" else "one-to-one-fd") else null,
+            requestUri = if (own) record.group else record.peer,
+            clientId = peer.clientId,
+            controllerPsi = if (type == TerminationType.EXTENSION_REQUEST) extensionControllerPsi(record) else null)
+        val parts = mutableListOf(Part(McdataInfo.CONTENT_TYPE, info.encode().toByteArray()))
+        if (own && record.group == null) parts += Part(ResourceLists.CONTENT_TYPE, ResourceLists.encode(listOf(record.peer)).toByteArray())
+        parts += Part(McdataService.SIGNALLING, message.encode())
+        val response = peer.send(parts, listOfNotNull(reason?.let { "Reason" to "SIP;cause=200;text=\"$it\"" }))
+        event("FD $action of $id: ${status(response)}")
+        if (!response.isSuccess) throw FdError("FD $action: ${status(response)}")
+        return update(id) { it.copy(release = if (type == TerminationType.REQUEST) "terminating" else "$action requested") }!!
+    }
+
+    /**
+     * TS 24.282 §13.2.4.5.2.2 3)a): the extension request "shall set <mcdata-controller-psi>" to the controlling
+     * function's PSI, stored from the intent to release (§13.2.4.5.2.1 2)a)iii)). Without one stored (the user asks
+     * before, or without, the server's intent, or the intent had no <mcdata-controller-psi>) the element is still
+     * mandatory: the only MCData server PSI the client knows is the one the MESSAGE goes to (§13.2.4.5.2.2 4)).
+     */
+    private fun extensionControllerPsi(record: FdRecord): String? = record.controllerPsi ?: peer.psi
+
+    /**
+     * The server's FD HTTP TERMINATION: the answer to a release (§6.3.6.1), a transmission stopped by policy
+     * (§13.2.3.3.4), the intent to release (§13.2.4.5.2.1, with the controller PSI for an extension request) and the
+     * answer to an extension request (§13.2.4.5.2.3).
+     */
+    private fun termination(info: McdataInfo?, message: FdHttpTermination) {
+        val id = message.messageId.toString()
+        val state = when (message.type) {
+            TerminationType.RESPONSE -> if (message.releaseSucceeded == true) "terminated" else "termination failed"
+            TerminationType.TRANSMISSION_STOPPED -> "stopped"
+            TerminationType.INTENT_TO_RELEASE -> "release pending"
+            TerminationType.EXTENSION_RESPONSE -> if (message.extensionAccepted == true) "extended" else "extension refused"
+            TerminationType.EXTENSION_REQUEST -> "extension requested"
+            else -> message.type.name.lowercase()
+        }
+        event("FD $id: $state")
+        update(id) { it.copy(release = state, controllerPsi = info?.controllerPsi ?: it.controllerPsi) }
+    }
+
     /** An FD NOTIFICATION to the originator (§12.2.1.1). */
     private suspend fun notify(record: FdRecord, type: FdNotificationType) {
         val notice = FdNotification(type, clock(), UUID.fromString(record.conversationId), UUID.fromString(record.id),
@@ -396,6 +484,7 @@ class FdService(
                 FD_SIGNALLING -> offer(info ?: return 400, FdSignalling.decode(part.content))
                 FD_NOTIFICATION -> notification(info, FdNotification.decode(part.content))
                 FD_NETWORK_NOTIFICATION -> networkNotification(FdNetworkNotification.decode(part.content))
+                FdHttpTermination.MESSAGE_TYPE -> termination(info, FdHttpTermination.decode(part.content))
                 else -> event("ignored FD message type ${MessageType.of(part.content)}")
             }
         } catch (e: McdataCodecError) {
@@ -478,6 +567,9 @@ class FdService(
             val safe = name.map { if (it == '/' || it == '\\' || it.isISOControl()) '_' else it }.joinToString("").trim().trimStart('.').take(120)
             return safe.ifEmpty { "file" }
         }
+
+        /** The SHA-256 of [data] in lower-case hex (RFC 5547 hash:sha-256, as [FileMetadata] holds it). */
+        fun sha256Bytes(data: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
 
         fun sha256(file: File): String {
             val digest = MessageDigest.getInstance("SHA-256")

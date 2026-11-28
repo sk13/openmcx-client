@@ -544,6 +544,8 @@ void Client::mcdata_tick() {
 //   mcdata-location request|configure ...  (TS 24.282 clauses 17.3.2.2 and 17.3.3.2)
 //   mcdata-msgstore <operation> ...        (TS 24.282 clause 21.2)
 //   mcdata-msgstore-ctrl enable|disable ... (TS 24.282 clause 21.3.2)
+//   mcdata-pre-establish | mcdata-pre-release   (the pre-established session, TS 24.282 clauses 18.3.2.1, 18.3.3.1.1;
+//                                     sds-media, a media plane standalone SDS and sds-session then go over it, 9.2.5)
 void Client::mcdata_command(const std::string &cmd) {
   if (!mcdata_enabled()) throw std::runtime_error("MCData is not configured");
   std::istringstream words(cmd);
@@ -552,6 +554,9 @@ void Client::mcdata_command(const std::string &cmd) {
   if (verb == "mcdata-affiliate" || verb == "mcdata-deaffiliate") {
     std::vector<std::string> groups;
     for (std::string group; words >> group;) groups.push_back(group);
+    // TS 24.282 clause 8.2.2: a de-affiliation a fulfilled rule holds is suppressed (mcdata/location_rules.cpp).
+    if (verb == "mcdata-deaffiliate")
+      mcdata_check_manual_deaffiliation(groups.empty() ? std::vector<std::string>{mcdata_group()} : groups);
     if (groups.empty()) return mcdata_affiliate(verb == "mcdata-affiliate");
     if (verb == "mcdata-affiliate")
       mcdata_change_affiliation(groups, {});
@@ -620,6 +625,8 @@ void Client::mcdata_command(const std::string &cmd) {
   if (verb == "sds-reply") return mcdata_sds_reply_command(words);
   if (verb == "mcdata-alert") return mcdata_alert_command(words);
   if (verb == "mcdata-fa") return mcdata_fa_command(words);
+  if (verb == "mcdata-pre-establish") return mcdata_pre_establish(); // TS 24.282 clause 18.3.2.1
+  if (verb == "mcdata-pre-release") return mcdata_pre_release();     // TS 24.282 clause 18.3.3.1.1
   mcdata_sds_command(verb, words);
 }
 
@@ -691,7 +698,8 @@ void Client::mcdata_sds_session_command(std::istringstream &words) {
     return mcdata_session_send(text, disposition);
   }
   if (word == "close") {
-    if (!mcdata_media_) throw std::runtime_error("no MCData SDS session is open");
+    // a communication over the pre-established session may still be being established (no media plane yet)
+    if (!mcdata_media_ && !mcdata_media_pre_) throw std::runtime_error("no MCData SDS session is open");
     std::string scope;
     words >> scope;
     mcdata_media_result_["state"] = "closed";
@@ -1013,6 +1021,7 @@ void Client::mcdata_fa_command(std::istringstream &words) {
   }
   if ((action != "activate" && action != "takeover" && action != "deactivate") || aliases.empty())
     throw std::runtime_error("usage: mcdata-fa activate|takeover|deactivate <alias>... | subscribe | unsubscribe");
+  if (action == "deactivate") mcdata_check_manual_alias_deactivation(aliases); // TS 24.282 clause 22.2.1.2
   return mcdata_functional_alias(action, aliases);
 }
 
@@ -1148,6 +1157,7 @@ void Client::mcdata_status() {
   status_["mcdata_last_result"] = mcdata_last_result_;
   status_["mcdata_discarded"] = mcdata_discarded_;
   status_["mcdata_media_result"] = mcdata_media_result_;
+  mcdata_pre_status();
   status_["mcdata_ipconn"] = ipcon_result_;
   status_["mcdata_release"] = mcdata_release_;
   status_["mcdata_enhanced_status"] = mcdata_enhanced_status_;
@@ -1210,6 +1220,11 @@ void Client::mcdata_status() {
   status_["mcdata_functional_alias_subscription_result"] = mcdata_alias_subscription_result_;
   status_["mcdata_functional_aliases_take_over_possible"] = mcdata_takeover_possible_;
   status_["mcdata_alert_state"] = mdea_name(mdea_);
+  // TS 24.282 annex G.4: the priority states (for the record; a test observes them by the requests they shape)
+  status_["mcdata_priority_states"] = {{"mdeg", mdeg_name(mdeg_)},   {"mdegc", mdegc_name(mdegc_)},
+                                       {"mdig", mdig_name(mdig_)},   {"mdigc", mdigc_name(mdigc_)},
+                                       {"mdepc", mdepc_name(mdepc_)}, {"mdepp", mdepp_},
+                                       {"group", mcdata_priority_group_}};
   status_["mcdata_emergency"] = mcdata_emergency_;
   status_["mcdata_alerts_received"] = mcdata_alerts_received_;
   status_["mcdata_alert_last_result"] = mcdata_alert_last_result_;

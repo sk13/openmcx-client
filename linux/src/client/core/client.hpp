@@ -377,6 +377,8 @@ class Client {
   MediaDescription local_;
   std::optional<MediaDescription> remote_;
   UdpSocket audio_, floor_;
+  // The sockets whose readability ends the run loop's SIP wait (client.cpp).
+  std::vector<int> wake_sockets() const;
   // Live audio for the dispatcher (media.live, mcptt/live_audio.cpp; off unless configured): "ptt live" transmits
   // 16 kHz 16-bit mono PCM that arrives on a local UDP port, and every received frame is sent as PCM to another
   // local port; the dispatcher's web service bridges both to the browser. Without media.live the client behaves as
@@ -403,6 +405,8 @@ class Client {
   std::deque<std::function<void()>> pending_;
   std::string token_, dialog_, subscription_, auth_etag_, affiliation_etag_, wav_path_, session_uri_,
       conference_subscription_;
+  // The group of the conference event subscription (its <mcptt-request-uri>, repeated when it is ended).
+  std::string conference_group_;
   std::optional<std::uint32_t> conference_version_;
   // RFC 4575: the participants of the conference notifications (MCPTT ID -> endpoint status), a partial notification
   // applied on top of them.
@@ -909,7 +913,8 @@ class Client {
             {"service_routes", status->service_routes}};
   }
 
-  std::pair<std::string, std::string> publish_body(bool affiliation);
+  // withdraw: the affiliation PIDF of the PUBLISH removing the affiliation (Expires 0), with an empty <status>.
+  std::pair<std::string, std::string> publish_body(bool affiliation, bool withdraw = false);
   // TS 24.379 clauses 7.2.2 6) and 7.2.3 4): the poc-settings of this MCPTT client.
   std::string mcptt_poc_settings() const;
 
@@ -1535,6 +1540,15 @@ private:
   std::string mcvideo_key_group_of(const std::string &group) const;
   bool mcvideo_use_group_key(const std::string &group);
   void mcvideo_update_key_subscriptions();
+  // TS 24.281 clauses 22.2.2.1.1 (2xx step 3) and 22.2.2.1.2 step 8 with TS 33.180 clause 5.7: the preconfigured
+  // groups whose security related information keys end-to-end protected MCVideo ad hoc group calls: the configured
+  // ones (mcvideo.adhoc_security_groups, else mcptt.adhoc_security_groups) and those a <preconfigured-group-id>
+  // named; their GMKs are subscribed to (mcvideo_update_key_subscriptions).
+  std::set<std::string> mcvideo_adhoc_security_groups_;
+  std::vector<std::string> mcvideo_configured_adhoc_security_groups() const;
+  bool mcvideo_use_adhoc_security(const std::string &preconfigured);
+  // The group whose GMK keys the call in progress (or, without one, the selected group's).
+  std::string mcvideo_call_key_group() const;
   void mcvideo_refresh_extra_key_subscription(const std::string &dialog);
   bool mcvideo_key_dialog(const std::string &dialog) const;
   // A group call asked for before its group's GMK is held (a chat group joined with implicit affiliation, a new
@@ -1727,7 +1741,7 @@ private:
   unsigned live_receive_dropped_ = 0;
   // The dialogs of MCVideo calls this client ended (mcvideo_end_call) before the SIP stack reported their end: they
   // stay the MCVideo service's until it does, so that a late state (the CONFIRMED of an answer refused in its media
-  // callback, which PJSIP reports before the ACK is sent) or media of theirs never reaches the MCPTT call.
+  // callback) or media of theirs never reaches the MCPTT call.
   std::set<std::string> mcvideo_closing_;
 
   // A state or the media of an MCVideo dialog in mcvideo_closing_ is consumed; its DISCONNECTED ends the entry.
@@ -1774,6 +1788,9 @@ private:
   // The Call-ID of this client's current registration (its REGISTER's, from the 200 (OK)): a reginfo <contact> with
   // another callid (RFC 3680 section 5.1) is not "belonging to this UE" (TS 24.229 clause 5.1.1.7).
   std::string registration_call_id_;
+  // The CSeq of that REGISTER: a reginfo <contact> of this client's binding with a lower cseq describes an earlier
+  // registration of it (client_rules::stale_reg_contact).
+  std::uint64_t registration_cseq_ = 0;
   // Emergency alerts (TS 24.281 clause 11.2): this user's, and those received by origin.
   bool mcvideo_alerting_ = false;
   Json mcvideo_alerts_ = Json::object(), mcvideo_alert_result_;
@@ -1888,6 +1905,27 @@ private:
   // criterion and area; none before the first position), and the aliases activated by a location criterion.
   std::vector<McvideoProfile::FunctionalAlias> mcvideo_alias_rules_;
   std::map<std::string, bool> mcvideo_alias_area_inside_;
+
+  // MCPTT location rules (mcptt/location_rules.cpp): TS 24.379 clause 9A.2.1.4 (functional aliases), clause 9.2.1.7.2
+  // (the user profile's affiliation rules) and clause 9.2.1.7.3 (the group documents' geographic areas). Where the
+  // client was in each rule's areas at the last position (none before the first), the last position, the areas of
+  // the group documents read, the groups left for being outside their mandatory area, and those a rule affiliated.
+  McpttProfileRules mcptt_location_rules_;
+  std::map<std::string, bool> mcptt_rule_area_inside_;
+  std::optional<location::Point> mcptt_last_position_;
+  std::map<std::string, GroupGeographicAreas> group_areas_;
+  std::set<std::string> area_left_groups_, rule_affiliated_groups_;
+  void take_profile_rules(const std::string &profile);
+  bool rule_area_crossed(const std::string &key, const std::vector<location::Area> &areas, bool entry, double lat,
+                         double lon);
+  void mcptt_location_rules(const location::Point &position);
+  bool rule_aliases_met(const McpttAffiliationRule &rule) const;
+  void affiliation_rules_aliases_changed(const std::set<std::string> &before);
+  void apply_affiliation_rules(const std::map<std::string, std::pair<bool, bool>> &fulfilled, const char *trigger);
+  void note_group_areas(const std::string &group, const std::string &document);
+  bool affiliation_allowed_here(const std::string &group) const;
+  void mcptt_group_areas();
+  void check_manual_deaffiliation(const std::vector<std::string> &groups) const;
   std::set<std::string> mcvideo_aliases_by_location_;
   void mcvideo_alias_location(const location::Point &position);
 
@@ -2430,6 +2468,8 @@ private:
   std::vector<SipHeader> mcdata_priority_headers(const char *level = "emergency") const;
 
   void mcdata_priority_response(const SipResponse &response);
+  // TS 24.282 clauses 6.2.8.1.17 and 6.2.8.1.18: the priority states on the release of a communication.
+  void mcdata_priority_released();
 
   void mcdata_priority_info(const mcdata::Info &info);
 
@@ -2579,6 +2619,60 @@ private:
 
   void mcdata_media_tick();
 
+  // ---- MCData pre-established session, mcdata/pre_established.cpp (TS 24.282 clause 18.3; SDS over it, clause
+  // 9.2.5; its media plane, TS 24.582 clause 12): one session at a time, established by "mcdata-pre-establish" and
+  // released by "mcdata-pre-release". While it is established and not in use, a standalone SDS over the media plane
+  // or an SDS session (one-to-one or group, normal priority) goes over it: a REFER, the participating function's
+  // re-INVITE, then the MSRP connection to the session's negotiated MSRP URI.
+  struct McdataPreSession {
+    // the INVITE dialog; the URI identifying the session (Contact of the 2xx); establishing, established, releasing
+    std::string dialog, uri;
+    std::string state = "establishing";
+    std::unique_ptr<msrp::Endpoint> listener; // the MSRP URI offered with "a=setup:actpass" (clause 18.3.1.1 1)f))
+    MsrpMedia local;                          // the offer (clause 18.3.1.1)
+    std::optional<MsrpMedia> remote;          // the participating function's answer
+    std::string ice_ufrag, ice_password;      // RFC 8839: the offer's ICE credentials (clause 18.3.2.1 10))
+    // The MCData communication using the session: "" (none), "requested" (REFER accepted), "established",
+    // "releasing" (REFER "BYE" sent); its MCData session identity (the Refer-To of the REFER "BYE", clause 9.2.5.4.1.1
+    // step 6) and the last <mcdata-communication-state> received.
+    std::string communication, communication_uri, last_state;
+    unsigned established = 0, terminated = 0; // communications established and terminated, for the user (MMI)
+    // The priority of the communication the sent REFER requested (TS 24.282 clauses 9.2.5.2.1.1 1a), 9.2.5.3.1.1
+    // 3A)/3C)): "" (none), "emergency" or "imminent"; group or one-to-one; the priority states before the REFER
+    // (restored on "establish-fail", clause 9.2.5.2.1.1 2)i)).
+    std::string priority;
+    bool priority_group = false;
+    struct States {
+      int mdegc, mdeg, mdea, mdigc, mdig, mdepc, mdepp;
+      bool emergency;
+      std::string group;
+    };
+    std::optional<States> before;
+  };
+
+  std::unique_ptr<McdataPreSession> mcdata_pre_;
+  bool mcdata_media_pre_ = false; // the open media plane communication uses the pre-established session
+
+  void mcdata_pre_establish();
+  void mcdata_pre_answered(const SipResponse &raw);
+  void mcdata_pre_release();
+  [[nodiscard]] bool mcdata_pre_usable() const;
+  MsrpMedia mcdata_pre_media(const std::string &direction) const;
+  std::string mcdata_pre_sdp(const std::string &setup) const;
+  void mcdata_pre_refer(const std::string &target, const mcdata::Info &info, const MsrpMedia &offer,
+                        const std::vector<BodyPart> &extra_parts = {}, const std::vector<SipHeader> &extra_headers = {},
+                        const std::string &priority = {});
+  void mcdata_pre_priority_granted(const SipMessage &reinvite, const mcdata::Info &info);
+  void mcdata_pre_priority_refused(const SipResponse &response);
+  void mcdata_pre_restore_states();
+  void mcdata_pre_leave();
+  void mcdata_pre_connect();
+  void mcdata_pre_drop_media();
+  std::optional<SipResponse> mcdata_pre_request(const SipMessage &message);
+  SipResponse mcdata_pre_reinvite(const SipMessage &message);
+  bool mcdata_pre_state(std::string_view dialog, SipCallState state);
+  void mcdata_pre_status();
+
   // ---- MCData file distribution over HTTP, mcdata/file_distribution.cpp (TS 24.282 clauses 10.2.2 to 10.2.4).
   static std::string sha256_hex(const std::string &data);
 
@@ -2656,6 +2750,25 @@ private:
   int mcdata_alias_subscription_result_ = 0;
   std::vector<std::pair<std::string, std::vector<std::string>>> mcdata_pending_alias_changes_;
   std::set<std::string> mcdata_takeover_possible_, mcdata_takeover_wanted_;
+
+  // MCData location rules (mcdata/location_rules.cpp): TS 24.282 clause 22.2.1.4 (functional aliases) and clause
+  // 8.2.6.2 (the MCData user profile's affiliation rules). Where the client was in each rule's areas at the last
+  // position (none before the first), the last position, the groups a rule affiliated, the aliases a location criterion
+  // activated and those the profile locks against a manual deactivation.
+  McpttProfileRules mcdata_location_rules_;
+  std::map<std::string, bool> mcdata_rule_area_inside_;
+  std::optional<location::Point> mcdata_last_position_;
+  std::set<std::string> mcdata_rule_affiliated_groups_, mcdata_aliases_by_location_, mcdata_alias_locks_;
+  void take_mcdata_profile_rules(const std::string &profile);
+  bool mcdata_rule_area_crossed(const std::string &key, const std::vector<location::Area> &areas, bool entry,
+                                double lat, double lon);
+  void mcdata_location_rules(const location::Point &position);
+  bool mcdata_rule_aliases_met(const McpttAffiliationRule &rule) const;
+  void mcdata_rules_aliases_changed(const std::set<std::string> &before);
+  void mcdata_apply_affiliation_rules(const std::map<std::string, std::pair<bool, bool>> &fulfilled,
+                                      const char *trigger);
+  void mcdata_check_manual_deaffiliation(const std::vector<std::string> &groups) const;
+  void mcdata_check_manual_alias_deactivation(const std::vector<std::string> &aliases) const;
 
   void mcdata_functional_alias(const std::string &action, const std::vector<std::string> &aliases);
 
@@ -2982,6 +3095,17 @@ private:
   // Calls over the session (TS 24.379 clauses 10.1.1.2.2, 10.1.2.2.2, 6.2.4.2; TS 24.380 clause 9.2.2).
   [[nodiscard]] bool pre_session_usable() const;
   [[nodiscard]] bool call_over_pre_session() const { return dialog_.starts_with("pre-call-"); }
+  // TS 24.379 clauses 10.1.1.2.1.3 to 10.1.1.2.1.5, 10.1.2.2.1.3 to 10.1.2.2.1.5, 11.1.1.2.1.4 and 11.1.1.2.1.5 ("This
+  // clause covers both on-demand session and pre-established sessions"): the dialog of a re-INVITE the client sends
+  // during a call: the call's own, or for a call over the pre-established session, which has no dialog of its own
+  // (its "pre-call-..." identifier), the session's, sent to its remote target, the URI identifying the session (the
+  // Contact of its 200 (OK), clause 8.2.2 step 9 a). Throws when the session is gone.
+  [[nodiscard]] std::string call_reinvite_dialog() const;
+  // The SDP offer of that re-INVITE: offer_media() in the call's own dialog (clause 6.2.1); in the session's "based
+  // upon the parameters already negotiated for the pre-established session" (clause 10.1.1.2.1.3 step 6, clause
+  // 10.1.1.2.1.4 step 7; NOTE 2: the same speech and floor control media-level sections), with the call's implicit
+  // floor request (clause 6.4) and the session's ICE attributes.
+  [[nodiscard]] MediaDescription call_reinvite_offer() const;
   std::string pre_session_refer_call(const std::vector<std::string> &targets, std::vector<BodyPart> parts,
                                      std::vector<SipHeader> entry_headers, const std::vector<SipHeader> &headers,
                                      bool with_sdp);
@@ -3027,6 +3151,8 @@ private:
   void provision_identity_keys();
   // One pass of the run loop.
   void run_once();
+  // The floor control packets waiting (run_once serves them twice a pass).
+  void floor_poll();
 
 public:
   // ---- Construction, start-up (core/client.cpp) ----

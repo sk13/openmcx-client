@@ -7,11 +7,12 @@
 // Warning header field, when a refused refresh token is dropped, the scope of the authentication request, the percent-decoding of an XCAP selector, the
 // escaped text of a control command, the groups of an MCPTT user profile, and the retry delay of a refused initial service authorisation, the
 // implicit floor request word of a call command, the SDP answer parameters kept, the GMK of a call's group, the end of an MCData PCK context and
-// the floor control streams of a call that go on under a new CSK, and the reg event timing and contact rules.
+// the floor control streams of a call that go on under a new CSK, the reg event timing and contact rules, and the
+// MCData-Info and SDP parts of a pre-established session (TS 24.282 clause 18.3).
 //
 // Specifications: TS 24.282 V19.7.0 (Rel-19), TS 24.379 V19.7.0 (Rel-19), TS 24.380 V19.2.0 (Rel-19),
 // TS 33.180 V19.4.0 (Rel-19), TS 24.484 V19.6.0 (Rel-19), TS 24.229 V19.7.0 (Rel-19), RFC 3261, RFC 3680, RFC 3903,
-// RFC 3986, RFC 6749.
+// RFC 3986, RFC 6749, RFC 8445, RFC 8839, RFC 6544.
 
 #pragma once
 
@@ -579,6 +580,33 @@ template <class Lookup> std::string key_group(const std::string &group, Lookup p
 }
 
 //------------------------------------------------------------------------------
+// TS 24.281 clauses 22.2.2.1.1 (2xx step 3) and 22.2.2.1.2 step 8 (TS 24.379 clauses 17.2.2.1.1 and 17.2.2.1.2 step
+// 7) with TS 33.180 clause 5.7: "if the <preconfigured-group-id> element received [...], shall use the security
+// related information from the group configuration associated with the received preconfigured group identity". The
+// group whose GMK keys the protected media of an ad hoc group call: the received <preconfigured-group-id>, else (a
+// re-INVITE without it) the one the call was keyed with; empty when there is none or it is no SIP URI: the call cannot
+// be keyed (invitee: 488; originator: the call ends).
+inline std::string adhoc_key_group(std::string_view received, std::string_view kept) {
+  std::string_view group = received.empty() ? kept : received;
+  while (!group.empty() && std::isspace(static_cast<unsigned char>(group.front()))) group.remove_prefix(1);
+  while (!group.empty() && std::isspace(static_cast<unsigned char>(group.back()))) group.remove_suffix(1);
+  if (!group.starts_with("sip:") && !group.starts_with("sips:")) return {};
+  return std::string(group);
+}
+
+//------------------------------------------------------------------------------
+// TS 24.281 clause 22.1 (as TS 24.379 clause 17.1) and TS 24.481 clause 6.3.13.2.1: the preconfigured groups whose GMK
+// the MCVideo service subscribes to from the start for its ad hoc group calls: mcvideo.adhoc_security_groups when
+// configured (even empty), else mcptt.adhoc_security_groups (one preconfigured group, with its MCPTT and MCVideo
+// configurations, serving both services), else none.
+inline std::vector<std::string> mcvideo_adhoc_security_groups(const std::optional<std::vector<std::string>> &mcvideo,
+                                                              const std::optional<std::vector<std::string>> &mcptt) {
+  if (mcvideo) return *mcvideo;
+  if (mcptt) return *mcptt;
+  return {};
+}
+
+//------------------------------------------------------------------------------
 // TS 33.180 clause 5.7 and annex E.6: among the keys for which usable(key) holds (the group among its MC group IDs,
 // active, not revoked, not expired), the one of the latest Activation time (activation(key)); null if none.
 template <class Map, class Usable, class Activation>
@@ -708,6 +736,31 @@ inline bool own_reg_contact(std::string_view contact_uri, std::string_view conta
 }
 
 //------------------------------------------------------------------------------
+// RFC 3680 section 5.1: a reginfo <contact> of this client's own binding (own_reg_contact) that describes an earlier
+// registration of it: its cseq, "the last CSeq value used to register this contact", is below the CSeq of the REGISTER
+// whose 200 (OK) this client last received, with the same Call-ID (CSeq numbers compare only within one Call-ID, RFC
+// 3261 section 8.1.1.5). A registrar whose reg event state lags the REGISTER it has just accepted (the binding a
+// log-off removed, still "terminated" in the first NOTIFY of the subscription after the log-on's REGISTER under the
+// same Call-ID, RFC 3261 section 10.2) says nothing of the current registration (TS 24.229 clause 5.1.1.7 acts on the
+// state of the binding the UE registered); a network deregistration of the current one carries its CSeq or a later.
+inline bool stale_reg_contact(std::string_view contact_callid, std::optional<std::uint64_t> contact_cseq,
+                              std::string_view registration_call_id, std::uint64_t registration_cseq) {
+  return contact_cseq && registration_cseq && !contact_callid.empty() && contact_callid == registration_call_id &&
+         *contact_cseq < registration_cseq;
+}
+
+//------------------------------------------------------------------------------
+// RFC 3261 section 20.16: the sequence number of a CSeq header field value ("4711 INVITE"); 0 when it has none.
+inline std::uint64_t cseq_number(std::string_view value) {
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+  std::uint64_t number = 0;
+  std::size_t digits = 0;
+  for (; digits < value.size() && digits < 10 && value[digits] >= '0' && value[digits] <= '9'; ++digits)
+    number = number * 10 + static_cast<std::uint64_t>(value[digits] - '0');
+  return digits && (digits == value.size() || value[digits] == ' ' || value[digits] == '\t') ? number : 0;
+}
+
+//------------------------------------------------------------------------------
 // RFC 6665 sections 4.1.3 and 8.2.1: what a received NOTIFY is to the reg event subscription (TS 24.229 clause
 // 5.1.1.3): not of the reg event package (the Event header field's event type, without parameters, is not "reg");
 // of this client's current subscription (its dialog, non-empty); or of a subscription the client does not know (a
@@ -794,6 +847,136 @@ inline std::string location_payload(std::string_view text) {
   const auto m = static_cast<std::uint32_t>(static_cast<std::int32_t>(std::floor(lon / 360.0 * 16777216.0))) & 0xFFFFFFu;
   return std::string{static_cast<char>(n >> 16), static_cast<char>((n >> 8) & 0xFF), static_cast<char>(n & 0xFF),
                      static_cast<char>(m >> 16), static_cast<char>((m >> 8) & 0xFF), static_cast<char>(m & 0xFF)};
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 annex D.1: an element added to the <anyExt> of the <mcdata-Params> of an application/vnd.3gpp.mcdata-info+xml
+// body (e.g. <pre-established-session-ind>, TS 24.282 clause 18.3.2.1 step 9): into the existing <anyExt>, or in a new
+// one closing <mcdata-Params>. Throws when the body has no <mcdata-Params>.
+inline std::string mcdata_info_with_any_ext(std::string xml, std::string_view element) {
+  const auto params_end = xml.find("</mcdata-Params>");
+  if (params_end == std::string::npos) throw std::invalid_argument("MCData-Info without <mcdata-Params>");
+  const auto ext_end = xml.rfind("</anyExt>", params_end);
+  const auto ext_open = xml.rfind("<anyExt>", params_end);
+  if (ext_end != std::string::npos && ext_open != std::string::npos && ext_open < ext_end)
+    xml.insert(ext_end, element);
+  else
+    xml.insert(params_end, "<anyExt>" + std::string(element) + "</anyExt>");
+  return xml;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 9.2.5.2.1.1, 9.2.5.3.1.1, 9.2.5.4.1.1 and 9.2.5.4.1.2: the <mcdata-communication-state> of the
+// participating function's re-INVITE within a pre-established session ("establish-request", "establish-success",
+// "establish-fail", "terminate-request", "terminated"), white space trimmed; empty when there is none. TS 37.579-7
+// writes the state "terminate request" (tables 6.1.14.3.3-11 and others): read as "terminate-request".
+inline std::string mcdata_communication_state(std::string_view info_xml) {
+  auto value = std::string(xml_element_content(info_xml, "mcdata-communication-state"));
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return {};
+  value = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+  if (value == "terminate request") value = "terminate-request";
+  return value;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 13.2.4.5.2.2 3)a): the <mcdata-controller-psi> of an FD HTTP TERMINATION message. An EXTENSION
+// REQUEST FOR COMM OVER HTTP "shall set" it to the controlling function's PSI, stored from the server's intent to
+// release (clause 13.2.4.5.2.1 2)a)iii)). With none stored (the user asks before, or without, the intent, or the intent
+// had no <mcdata-controller-psi>) the element is still mandatory: the only MCData server PSI the client knows is the one
+// the MESSAGE goes to (clause 13.2.4.5.2.2 4)). Any other termination type carries none (empty).
+inline std::string extension_controller_psi(bool extension_request, std::string_view stored,
+                                            std::string_view mcdata_psi) {
+  if (!extension_request) return {};
+  return std::string(stored.empty() ? mcdata_psi : stored);
+}
+
+//------------------------------------------------------------------------------
+// The MCData priority states of TS 24.282 annex G.4 as numbers (the n of "MDEG n: ...").
+struct McdataPriorityStates {
+  int mdeg = 1, mdegc = 1, mdea = 1, mdig = 1, mdigc = 1, mdepc = 1, mdepp = 1;
+};
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 6.2.8.1.16: the participating function's re-INVITE within the pre-established session targeted by
+// the REFER of an emergency or imminent peril group communication, with the <emergency-ind>, <imminentperil-ind> and
+// <alert-ind> it carries (empty: absent):
+//   1) MDEGC 2: a) no <emergency-ind>, or "true", and no <imminentperil-ind>: i) MDEG 2, ii) MDEGC 3; b) MDEA 2:
+//      <alert-ind> "true" or absent: MDEA 3, "false": MDEA 1;
+//   2) MDIGC 2: a) <imminentperil-ind> "true" or absent: i) MDIGC 3, ii) MDIG 2; b) "false" with <emergency-ind" "true":
+//      MDEG 2. The clause leaves MDIGC and MDIG as they were in b); the request was denied (the NOTE), so they go back
+//      to "MDIGC 1" and (from "MDIG 4: confirm-pending") "MDIG 1", as clause 6.2.8.1.13 3) has for the same correction
+//      by SIP INFO.
+inline McdataPriorityStates pre_group_priority_granted(McdataPriorityStates s, std::optional<bool> emergency,
+                                                       std::optional<bool> imminent, std::optional<bool> alert) {
+  if (s.mdegc == 2) {
+    if (emergency != false && !imminent.has_value()) {
+      s.mdeg = 2;
+      s.mdegc = 3;
+    }
+    if (s.mdea == 2) s.mdea = alert == false ? 1 : 3;
+  }
+  if (s.mdigc == 2) {
+    if (imminent != false) {
+      s.mdigc = 3;
+      s.mdig = 2;
+    } else if (emergency == true) {
+      s.mdeg = 2;
+      s.mdigc = 1;
+      if (s.mdig == 4) s.mdig = 1;
+    }
+  }
+  return s;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clause 9.2.5.2.1.1, re-INVITE 3)a): the grant of an emergency one-to-one communication over the
+// pre-established session: MDEPC 2 or 3: i) MDEPP 2, ii) MDEPC 3 (iii), MDPEA: no one-to-one emergency alert here).
+inline McdataPriorityStates pre_private_priority_granted(McdataPriorityStates s) {
+  if (s.mdepc == 2 || s.mdepc == 3) {
+    s.mdepp = 2;
+    s.mdepc = 3;
+  }
+  return s;
+}
+
+//------------------------------------------------------------------------------
+// The priority states on the release of a communication:
+//   TS 24.282 clause 6.2.8.1.17 (group): 1) MDEGC 2: a) MDEGC 1, b) the "confirm-pending" emergency group state back
+//     to "MDEG 1" (the clause writes "MDEG 3: confirm-pending"; MDEG 3 is "cancel-pending", annex G.4.4: read as MDEG
+//     4), c) MDEA 2 -> MDEA 1; 2) MDIGC 2: a) MDIG 4 -> MDIG 1, b) MDIGC 1.
+//   TS 24.282 clause 6.2.8.1.18 (one-to-one): 1) MDEPC 2: a) MDEPC 1, b) MDEPP 3 -> MDEPP 1, c) MDPEA 2 -> MDPEA 1.
+// Beyond the clauses, a granted communication's states (MDEGC 3, MDIGC 3, MDEPC 3) return to "capable" (the next
+// communication is a new request) and MDEPP, the state "of the private communication" (annex G.4.10), to 1; the
+// in-progress states of the group (MDEG 2, MDIG 2) last until cancelled.
+inline McdataPriorityStates priority_released(McdataPriorityStates s) {
+  if (s.mdegc == 2) {
+    if (s.mdeg == 4) s.mdeg = 1;
+    if (s.mdea == 2) s.mdea = 1;
+  }
+  if (s.mdigc == 2 && s.mdig == 4) s.mdig = 1;
+  if (s.mdepc == 2 && s.mdepp == 3) s.mdepp = 1;
+  s.mdegc = s.mdigc = s.mdepc = s.mdepp = 1;
+  if (s.mdeg == 4) s.mdeg = 1;
+  if (s.mdig == 4) s.mdig = 1;
+  return s;
+}
+
+//------------------------------------------------------------------------------
+// TS 24.282 clauses 18.3.2.1 step 1 and 18.3.1.1 with RFC 8839 sections 5.1 and 5.4 and RFC 6544 section 4.5: the ICE
+// attributes of the "m=message" section of the pre-established session's SDP offer: the client's credentials and its
+// one host candidate, the passive TCP candidate of its MSRP listener (the MCData UE gathers candidates only on the
+// interface it obtains MCData service on, the clause's NOTE). Each line ends with CRLF.
+inline std::string msrp_ice_attributes(std::string_view ufrag, std::string_view password, std::string_view address,
+                                       std::uint16_t port) {
+  // RFC 8445 section 5.1.2.1: priority = 2^24 * type preference (126, host) + 2^8 * local preference + (256 -
+  // component ID); RFC 6544 section 4.2: the local preference of a passive TCP host candidate, 2^13 * direction
+  // preference (4 for passive among host candidates) + other preference (8191).
+  constexpr std::uint32_t priority = (126u << 24) | (((4u << 13) | 8191u) << 8) | (256u - 1u);
+  std::string out = "a=ice-ufrag:" + std::string(ufrag) + "\r\na=ice-pwd:" + std::string(password) + "\r\n";
+  out += "a=candidate:1 1 TCP " + std::to_string(priority) + " " + std::string(address) + " " + std::to_string(port) +
+         " typ host tcptype passive\r\n";
+  return out;
 }
 
 } // namespace mcx::client_rules

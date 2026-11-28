@@ -46,7 +46,7 @@ and migration are not implemented in any of them.
   cache variable `OPENMCX_SERVER_DIR` (default `../../openmcx-server` from `linux/`). [`linux/CMakeLists.txt`](../linux/CMakeLists.txt)
   adds that checkout as a subdirectory and links its `mcx_sip` library, which brings `mcx_core` and `mcx_keying`.
   From the server repository the client takes:
-  - the SIP engine (`SipEngine`, built on PJSIP) with registration, PUBLISH, SUBSCRIBE, INVITE sessions and the body
+  - the SIP engine (`SipEngine`, built on reSIProcate) with registration, PUBLISH, SUBSCRIBE, INVITE sessions and the body
     filters used for XML protection;
   - the MC protocol bodies and codecs: MCPTT/MCVideo/MCData information, SDP, floor control and transmission control
     messages, MSRP, conference and affiliation documents, location, IP connectivity, AMR-WB and H.264 media;
@@ -147,7 +147,7 @@ parts are active only when the configuration has an `mcdata` or `mcvideo` object
 flowchart TB
   subgraph Process["mcx-client process (one thread for all protocol work)"]
     LOOP["Client::run_once()"]
-    SIP["SipEngine::poll (PJSIP events)<br/>callbacks: incoming, call state, media"]
+    SIP["SipEngine::poll (SIP stack events)<br/>callbacks: incoming, call state, media"]
     TASKS["pending_ tasks (schedule)<br/>timed_ tasks (schedule_after)"]
     CMD["Control FIFO lines<br/>Client::command"]
     FLOOR["floor socket: floor_packet"]
@@ -398,7 +398,10 @@ sequenceDiagram
   notifications are answered by `mcdata_notify`; timer TDU1 is kept per message.
 - **SDS and FD over the media plane.** `sds-media`, `sds-session`, `fd-media` open an INVITE with MSRP media
   (`mcdata/media.cpp`, TS 24.282 clause 9.2.3 with TS 24.582); the terminating side is `mcdata_media_invite`
-  (`mcdata/media_session.cpp`).
+  (`mcdata/media_session.cpp`). With a pre-established session (`mcdata-pre-establish`, `mcdata/pre_established.cpp`,
+  TS 24.282 clauses 18.3 and 9.2.5) they go by REFER within it instead: `mcdata_pre_refer`, then the participating
+  function's re-INVITE (`mcdata_pre_reinvite`) starts the MSRP connection to the session's MSRP URI; `mcdata_media_close`
+  leaves by a REFER "BYE".
 - **File distribution over HTTP.** `fd-send` → `mcdata_send_file` (`mcdata/file_distribution.cpp`, TS 24.282 clause
   10.2.4.2.1): upload to the media storage function, then a SIP MESSAGE with the FD signalling; `fd-accept`,
   `fd-reject`, `fd-defer` answer an offer.
@@ -711,7 +714,7 @@ linux/tools/build-image -t openmcx-client:<tag>
 docker build -t openmcx-dispatcher:<tag> --build-arg CLIENT_IMAGE=openmcx-client:<tag> dispatcher
 ```
 
-The [Dockerfile](../dispatcher/Dockerfile) builds the Go service in `openmcx-dev:0.4` (running `go vet` and
+The [Dockerfile](../dispatcher/Dockerfile) builds the Go service in `openmcx-dev:0.5` (running `go vet` and
 `go test`) and copies the binary into the image named by `CLIENT_IMAGE`. Unit tests use a fake engine
 (`service/testdata/fake-engine`); lab and browser checks are in `dispatcher/lab/`. Scope, limits, options and the API
 are in the [dispatcher README](../dispatcher/README.md).
@@ -755,7 +758,7 @@ that `app` implements, so its unit tests run on the JVM (`tools/gradle-docker.sh
 
 | Aspect | Android (`android/core`) | Linux (`linux/`) |
 |---|---|---|
-| SIP | Own stack (`sip/`), one outbound TLS flow with `+sip.instance` and `reg-id`, CRLF keepalives; the phone never listens | PJSIP-based `SipEngine` from openmcx-server; a listening Contact, or RFC 5626 with `sip.outbound` |
+| SIP | Own stack (`sip/`), one outbound TLS flow with `+sip.instance` and `reg-id`, CRLF keepalives; the phone never listens | reSIProcate-based `SipEngine` from openmcx-server; a listening Contact, or RFC 5626 with `sip.outbound` |
 | Concurrency | Kotlin coroutines, `StateFlow` state | One run loop |
 | Floor | `FloorParticipant`, no queueing | `FloorParticipantTimers` with queueing |
 | Speech | Platform AMR-WB (`MediaCodec`), `AudioRecord`/`AudioTrack` | AMR-WB libraries in the image, WAV files or live PCM |
@@ -829,7 +832,7 @@ docker build -t openmcx-dispatcher:<tag> --build-arg CLIENT_IMAGE=openmcx-client
 android/tools/gradle-docker.sh :app:assembleDebug
 ```
 
-The client image builds in `openmcx-dev:0.4` (from openmcx-server), runs `test_binary.py`, and ships a stripped binary
+The client image builds in `openmcx-dev:0.5` (from openmcx-server), runs `test_binary.py`, and ships a stripped binary
 on Ubuntu 24.04 with the run-time libraries (libsrtp2, opencore-amrwb, vo-amrwbenc, OpenH264, libcurl, libxml2) and
 the lab health check ([Dockerfile](../linux/docker/Dockerfile)).
 

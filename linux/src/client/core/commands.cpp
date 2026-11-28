@@ -241,7 +241,7 @@ void Client::run_command(const std::string &cmd) {
     if (dialog_.empty()) {
       failure("refresh-reinvite: no call");
     } else {
-      auto offer = offer_media();
+      auto offer = call_reinvite_offer();
       std::istringstream words(cmd.substr(std::string_view("refresh-reinvite").size()));
       for (std::string word; words >> word;) {
         if (word == "hold") {
@@ -269,7 +269,7 @@ void Client::run_command(const std::string &cmd) {
       const auto sequence = ++refresh_sequence_;
       status_["last_refresh_offer"] = {
           {"sequence", sequence}, {"floor_ssrc", offer.floor_ssrc}, {"direction", offer.direction}};
-      sip_.reinvite(dialog_, offer, {}, [this, sequence](const SipResponse &response) {
+      sip_.reinvite(call_reinvite_dialog(), offer, {}, [this, sequence](const SipResponse &response) {
         if (response.status_code < 200) return;
         status_["last_refresh"] = {{"sequence", sequence}, {"status", response.status_code}};
         event("session_refresh_answered", {{"status", response.status_code}, {"sequence", sequence}});
@@ -288,10 +288,13 @@ void Client::run_command(const std::string &cmd) {
     hangup_command();
   } else if (cmd == "affiliate") {
     if (!authorized_) throw std::runtime_error("authorization required");
+    // TS 24.379 clause 9.2.1.7.3: not outside the group's permitted or mandatory geographic area.
+    if (!affiliation_allowed_here(group())) throw std::runtime_error("outside the group's geographic area");
     desired_affiliation_ = true;
     left_selected_ = false;
     affiliate();
   } else if (cmd == "deaffiliate") {
+    check_manual_deaffiliation({group()}); // TS 24.379 clause 9.2.1.2
     deaffiliate_command();
   } else if (cmd.starts_with("mbms ")) {
     mbms_command(cmd);
@@ -565,6 +568,7 @@ void Client::group_call_command(const std::string &cmd) {
 // TS 24.481 clause 7.2.4.2: keep <preconfigured-group-use-only> of a group document read (TS 24.379 clauses
 // 10.1.1.2.1.1, 10.1.2.2.1.1).
 void Client::note_group_document(const std::string &group, const std::string &document) {
+  note_group_areas(group, document); // TS 24.379 clause 9.2.1.7.3 (mcptt/location_rules.cpp)
   try {
     preconfigured_use_only_[group] = group_preconfigured_use_only(document);
   } catch (const std::exception &) {
@@ -756,7 +760,7 @@ void Client::chat_join_command(const std::string &cmd) {
           failure("chat join: " + std::to_string(response.status_code));
         } else if (response.status_code >= 200 && !dialog_.empty()) {
           status_["last_call_failure"] = {{"status", response.status_code}, {"warning", ""}};
-          // Not from within PJSIP's handling of the 200 (OK): ending the session there aborts on its reference count.
+          // Not from within the SIP engine's handling of the 200 (OK): the BYE goes once that has returned.
           schedule([this, id = dialog_] {
             if (dialog_ == id) sip_.bye(id);
           });
@@ -883,7 +887,7 @@ void Client::deaffiliate_command() {
     release();
     if (!dialog_.empty()) sip_.bye(dialog_);
   }
-  auto [type, body] = publish_body(true);
+  auto [type, body] = publish_body(true, true); // an empty <status>: no group is left
   sip_.publish(service(), type, body,
                {{"P-Preferred-Service", mcptt_icsi},
                 {"Event", "presence"},

@@ -76,7 +76,7 @@ void Client::end_service_subscriptions(bool send) {
     }
     sip_.request_in_dialog(dialog, "SUBSCRIBE", "", "",
                            {{"Event", event_name},
-                            {"Accept", event_name == "xcap-diff" ? "application/xcap-diff+xml"
+                            {"Accept", std::string_view(event_name) == "xcap-diff" ? "application/xcap-diff+xml"
                                                                   : "application/pidf+xml"},
                             {"Expires", "0"},
                             {"P-Preferred-Service", icsi}});
@@ -103,6 +103,12 @@ void Client::end_service_subscriptions(bool send) {
   mcvideo_wanted_key_groups_.clear();
   mcvideo_left_selected_ = false;
   mcvideo_alias_area_inside_.clear();
+  mcptt_rule_area_inside_.clear();
+  area_left_groups_.clear();
+  rule_affiliated_groups_.clear();
+  mcdata_rule_area_inside_.clear();
+  mcdata_rule_affiliated_groups_.clear();
+  mcdata_aliases_by_location_.clear();
   mcvideo_aliases_by_location_.clear();
   mcvideo_group_keys_.clear();
   mcvideo_key_wait_.reset();

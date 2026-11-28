@@ -5,6 +5,7 @@
 package org.openmcx.client.mcvideo
 
 import org.openmcx.client.media.AmrWb
+import org.openmcx.client.mcptt.McpttSdp
 import org.openmcx.client.mcptt.SdpNegotiationError
 import org.openmcx.client.sdp.MediaDescription
 import org.openmcx.client.sdp.SessionDescription
@@ -22,13 +23,29 @@ data class LocalVideoMedia(
     val videoSsrc: Long,
     /** The implicit transmission request (§6.4, TS 24.581 §14.2.5): the sender of a push, the pulled user. */
     val implicitRequest: Boolean = false,
+    /**
+     * TS 24.281 §6.4 and §15.2.1.1 step 13: the offer's "mc_implicit_request" asks the server to grant the terminating
+     * client (the viewed-to user of a remotely initiated ambient viewing call), not this one: this client does not
+     * enter 'U: pending request to transmit' and offers no "mc_granted".
+     */
+    val implicitForPeer: Boolean = false,
     /** RFC 3264 direction of the audio and video: `recvonly` for the viewing user of an ambient viewing call, `sendonly` for the viewed-to user. */
     val direction: String = "sendrecv",
     /** Protected media (TS 24.281 4.7): audio and video as RTP/SAVP. */
     val protected: Boolean = false,
     /** A private call's PCK, the base64 MIKEY I_MESSAGE of `a=key-mgmt:mikey` (RFC 4567), in an offer. */
     val keyMgmt: String? = null,
-)
+    /** TS 24.581 §14.2.3 and §14.2.6: the "mc_priority" and "mc_reception_priority" offered (null: the default). */
+    val priority: Int? = null,
+    val receptionPriority: Int? = null,
+    /** TS 24.581 §14.2.4: "mc_granted", only in the offer of an initial INVITE with an implicit request (§14.5). */
+    val granted: Boolean = false,
+    /** TS 24.581 §14.2.2: "mc_queueing", the queueing of Transmission Requests. */
+    val queueing: Boolean = false,
+) {
+    /** This client's own implicit transmission request (TS 24.281 §6.4 first paragraph), not one for the peer. */
+    val ownImplicitRequest get() = implicitRequest && !implicitForPeer
+}
 
 /** What the MCVideo server negotiated. */
 data class RemoteVideoMedia(
@@ -51,6 +68,17 @@ data class RemoteVideoMedia(
     val keyMgmt: String? = null,
     /** The peer's AMR-WB `mode-set` (RFC 4867 §8.1); empty: every mode. */
     val modeSet: List<Int> = emptyList(),
+    /** "mc_reception_priority" (TS 24.581 §12.1.2.2). */
+    val receptionPriority: Int? = null,
+    /** "mc_implicit_request": in an answer, the implicit request accepted (§12.1.2.2 NOTE 5). */
+    val implicitRequest: Boolean = false,
+    /** "mc_granted": in an answer, the permission to transmit granted to the offerer (§12.1.2.2 NOTE 3). */
+    val granted: Boolean = false,
+    /** "mc_audio_ssrc" and "mc_video_ssrc" of an answer: the SSRCs to send with once granted (§14.4). */
+    val grantedAudioSsrc: Long? = null,
+    val grantedVideoSsrc: Long? = null,
+    /** "mc_queueing" (§12.1.2.2). */
+    val queueing: Boolean = false,
 ) {
     val transmissionControl get() = controlPort != null
 }
@@ -59,7 +87,7 @@ data class RemoteVideoMedia(
  * SDP for an MCVideo call (TS 24.281 §6.2.1–6.2.2, TS 24.581 §14) as the OpenMCX server takes it:
  * one AMR-WB audio stream, one H.264 video stream (RFC 6184 packetization mode 1, Constrained
  * Baseline level 3.1), each with a single payload type, `a=rtcp` and `a=ssrc`, and, under
- * transmission control, `m=application <port> udp MCVideo`. No queueing is offered.
+ * transmission control, `m=application <port> udp MCVideo` with the parameters of TS 24.581 §12.1.2.
  */
 object McvideoSdp {
     const val AUDIO_PT = 96
@@ -81,7 +109,6 @@ object McvideoSdp {
             if (issued.add(ssrc)) return ssrc
         }
     }
-    private fun sessionId() = (random.nextInt() and 0x7fffffff).toLong()
 
     private fun audio(local: LocalVideoMedia, pt: Int, octetAligned: Boolean) = MediaDescription(
         "audio", local.audioPort, if (local.protected) "RTP/SAVP" else "RTP/AVP", listOf(pt.toString()), info = "audio component of MCVideo",
@@ -108,30 +135,47 @@ object McvideoSdp {
         ),
     )
 
-    private fun control(port: Int, ssrc: Long, priority: Int?, implicit: Boolean) = MediaDescription(
+    private fun control(port: Int, ssrc: Long, priority: Int?, implicit: Boolean, receptionPriority: Int? = null, granted: Boolean = false,
+                        queueing: Boolean = false) = MediaDescription(
         "application", port, "udp", listOf("MCVideo"),
-        attributes = listOf("fmtp" to "MCVideo mc_transmission_ssrc=$ssrc" + (priority?.let { ";mc_priority=$it" } ?: "") +
-            (if (implicit) ";mc_implicit_request" else "")),
+        attributes = listOf("fmtp" to "MCVideo mc_transmission_ssrc=$ssrc" + (if (queueing) ";mc_queueing" else "") + (priority?.let { ";mc_priority=$it" } ?: "") +
+            (receptionPriority?.let { ";mc_reception_priority=$it" } ?: "") +
+            (if (implicit) ";mc_implicit_request" else "") + (if (granted && implicit) ";mc_granted" else "")),
     )
 
-    private fun session(local: LocalVideoMedia, media: List<MediaDescription>) = SessionDescription(
-        origin = "- ${sessionId()} 1 IN IP4 ${local.address}", sessionName = "MCVideo",
+    /**
+     * [origin] is the o= of one call's SDP (RFC 4566 §5.2, RFC 3264 §8), shared with MCPTT: one session ID for the whole
+     * session and the version one higher in each offer or answer this client makes in it, re-INVITEs included.
+     */
+    private fun session(local: LocalVideoMedia, media: List<MediaDescription>, origin: McpttSdp.Origin) = SessionDescription(
+        origin = origin.next(local.address), sessionName = "MCVideo",
         connection = "IN IP4 ${local.address}", media = media,
         attributes = listOfNotNull(local.keyMgmt?.let { "key-mgmt" to "mikey $it" }),
     )
 
-    /** An offer; without [LocalVideoMedia.controlPort] the call has no transmission control. */
-    fun offer(local: LocalVideoMedia): String = session(local, listOfNotNull(
+    /**
+     * An offer; without [LocalVideoMedia.controlPort] the call has no transmission control. TS 24.581 §14.2.3 and §14.2.6:
+     * the priorities when not the default; §14.2.4: "mc_granted" only with [LocalVideoMedia.granted] and an implicit
+     * request (callers set it only for the initial INVITE, §14.5).
+     */
+    fun offer(local: LocalVideoMedia, origin: McpttSdp.Origin = McpttSdp.Origin()): String = session(local, listOfNotNull(
         audio(local, AUDIO_PT, false), video(local, VIDEO_PT),
-        local.controlPort?.let { control(it, local.controlSsrc, null, local.implicitRequest) },
-    )).encode()
+        local.controlPort?.let { control(it, local.controlSsrc, local.priority, local.implicitRequest, local.receptionPriority,
+            local.granted && local.ownImplicitRequest, local.queueing) },
+    ), origin).encode()
 
-    /** Answer [offer] with its payload types; transmission control only if it was offered. */
-    fun answer(offer: RemoteVideoMedia, local: LocalVideoMedia): String = session(local, listOfNotNull(
+    /**
+     * Answer [offer] with its payload types; transmission control only if it was offered. TS 24.581 §14.3.3: an offered
+     * "mc_priority" (and, the same, "mc_reception_priority") returned unchanged; §14.3.1: no parameter the offer lacked,
+     * so "mc_implicit_request" only when offered (a pulled user's implicit request otherwise has no SDP of its own: its
+     * Transmission Request follows at T100 unless the server grants first).
+     */
+    fun answer(offer: RemoteVideoMedia, local: LocalVideoMedia, origin: McpttSdp.Origin = McpttSdp.Origin()): String = session(local, listOfNotNull(
         audio(local, offer.audioPayloadType, offer.octetAligned), video(local, offer.videoPayloadType),
         if (offer.transmissionControl) control(local.controlPort ?: throw SdpNegotiationError("no local control port"),
-            local.controlSsrc, offer.priority, local.implicitRequest) else null,
-    )).encode()
+            local.controlSsrc, offer.priority, local.implicitRequest && offer.implicitRequest, offer.receptionPriority,
+            queueing = offer.queueing && local.queueing) else null,
+    ), origin).encode()
 
     /** The remote side of [sdp] (an offer or an answer). */
     fun remote(sdp: String): RemoteVideoMedia {
@@ -155,13 +199,28 @@ object McvideoSdp {
             protected = audio.proto == "RTP/SAVP" || video.proto == "RTP/SAVP",
             keyMgmt = (session.attributes.firstOrNull { it.first == "key-mgmt" }?.second ?: audio.attribute("key-mgmt"))
                 ?.takeIf { it.startsWith("mikey ") }?.removePrefix("mikey ")?.trim(),
-            modeSet = try { AmrWb.modeSet(audioFmtp["mode-set"]) } catch (e: IllegalArgumentException) { throw SdpNegotiationError(e.message ?: "mode-set") })
+            modeSet = try { AmrWb.modeSet(audioFmtp["mode-set"]) } catch (e: IllegalArgumentException) { throw SdpNegotiationError(e.message ?: "mode-set") },
+            receptionPriority = controlParams?.get("mc_reception_priority")?.toIntOrNull(),
+            implicitRequest = controlParams?.containsKey("mc_implicit_request") == true,
+            granted = controlParams?.containsKey("mc_granted") == true,
+            grantedAudioSsrc = controlParams?.get("mc_audio_ssrc")?.toLongOrNull(),
+            grantedVideoSsrc = controlParams?.get("mc_video_ssrc")?.toLongOrNull(),
+            queueing = controlParams?.containsKey("mc_queueing") == true)
     }
 
     private val DIRECTIONS = listOf("sendrecv", "sendonly", "recvonly", "inactive")
 
-    /** RFC 3264 §6.1: a `sendonly` offer is answered `recvonly` and a `recvonly` one `sendonly`. */
-    fun answerDirection(offered: String): String = when (offered) { "sendonly" -> "recvonly"; "recvonly" -> "sendonly"; else -> offered }
+    /**
+     * RFC 3264 §6.1: a `sendonly` offer is answered `recvonly` and a `recvonly` one `sendonly`. With [receiveOnly] (the
+     * called user of a one-to-one video push, TS 24.281 §13.2.2.2, who only watches) a `sendrecv` offer is answered
+     * `recvonly`, which §6.1 allows, and a `recvonly` one `inactive`.
+     */
+    fun answerDirection(offered: String, receiveOnly: Boolean = false): String = when (offered) {
+        "sendonly" -> "recvonly"
+        "recvonly" -> if (receiveOnly) "inactive" else "sendonly"
+        "sendrecv" -> if (receiveOnly) "recvonly" else "sendrecv"
+        else -> offered
+    }
 
     /** fmtp parameters, separated by `;` (or `:`, which the server also accepts between parameters). */
     private fun params(text: String): Map<String, String?> = text.split(';', ':').map { it.trim() }.filter { it.isNotEmpty() }

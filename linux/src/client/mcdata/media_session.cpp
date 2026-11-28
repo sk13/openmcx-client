@@ -404,11 +404,18 @@ void Client::mcdata_media_answer_offer(SipResponse &response, const SipMessage &
 // TS 24.282 clause 6.2.8.1.17: release the communication over the media plane (SIP BYE request) and return the
 // communication states.
 void Client::mcdata_media_close(const std::vector<SipHeader> &bye_headers) {
-  if (!mcdata_media_dialog_.empty()) {
+  if (mcdata_media_pre_) {
+    // TS 24.282 clause 9.2.5.4.1.1: a communication within the pre-established session is left by a REFER "BYE",
+    // also while it is still being established (the REFER accepted, no re-INVITE "establish-success" yet); the
+    // session stays.
+    mcdata_media_dialog_.clear();
+    schedule([this] { mcdata_pre_leave(); });
+  } else if (!mcdata_media_dialog_.empty()) {
     const auto dialog = mcdata_media_dialog_;
     mcdata_media_dialog_.clear();
     schedule([this, dialog, bye_headers] { sip_.bye(dialog, {}, bye_headers); });
   }
+  mcdata_media_pre_ = false;
   mcdata_media_.reset();
   ++mcdata_media_serial_; // the notifications of its messages now go by SIP MESSAGE (TS 24.282 clause 9.2.4.2.4)
   mcdata_media_pending_.clear();
@@ -422,15 +429,25 @@ void Client::mcdata_media_close(const std::vector<SipHeader> &bye_headers) {
   mcdata_media_offered_ = nullptr;
   mcdata_media_key_.reset();
   mcdata_media_peer_.clear();
-  mdepc_ = 1;
+  mcdata_priority_released();
+}
 
-  // TS 24.282 clause 6.2.8.1.17: releasing the communication returns the communication states, and
-  // a request that was still pending; the in-progress state of the group itself
-  // lasts until it is cancelled, so MDEG 2 and MDIG 2 are left alone.
-  mdegc_ = 1;
-  mdigc_ = 1;
-  if (mdeg_ == 4) mdeg_ = 1;
-  if (mdig_ == 4) mdig_ = 1;
+//------------------------------------------------------------------------------
+// The priority states on the release of the communication, by the user or the server, granted or still being
+// established: TS 24.282 clauses 6.2.8.1.17 and 6.2.8.1.18 (client_rules::priority_released).
+void Client::mcdata_priority_released() {
+  auto s = client_rules::priority_released({mdeg_, mdegc_, mdea_, mdig_, mdigc_, mdepc_, mdepp_});
+  mdeg_ = s.mdeg;
+  mdegc_ = s.mdegc;
+  mdea_ = s.mdea;
+  mdig_ = s.mdig;
+  mdigc_ = s.mdigc;
+  mdepc_ = s.mdepc;
+  mdepp_ = s.mdepp;
+  if (mcdata_pre_) {
+    mcdata_pre_->priority.clear();
+    mcdata_pre_->before.reset();
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -600,6 +617,8 @@ void Client::mcdata_media_file_received(const std::string &transferred) {
 // TS 24.582 clauses 6.1.1.2.1 and 7.1.2.1: the MSRP loop: send the pending SDS or file once the connection is bound,
 // and end a standalone transfer once its SEND is answered.
 void Client::mcdata_media_tick() {
+  // TS 24.282 clause 18.3.1.1 1)f): the MSRP listener of the pre-established session's "actpass" offer.
+  if (mcdata_pre_ && mcdata_pre_->listener) mcdata_pre_->listener->poll();
   if (!mcdata_media_) return;
   mcdata_media_->poll();
   if (!mcdata_media_pending_.empty() && mcdata_media_->connected()) {

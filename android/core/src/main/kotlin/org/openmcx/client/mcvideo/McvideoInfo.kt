@@ -41,6 +41,8 @@ data class McvideoInfo(
     val participantCriteria: String? = null,
     val adhocAlert: Boolean? = null,
     val adhocAlertReceived: Boolean? = null,
+    /** In `<anyExt>`: an emergency ad hoc group call (TS 24.281 §6.2.8.1.19 step 2, §22.2.2.2.1 step 4). */
+    val adhocEmergency: Boolean? = null,
     /**
      * In `<anyExt>` (TS 24.281 Annex F.1.2), functional aliases (§20): the alias presented by the caller, the alias
      * called, the call to an alias, and the <req-type> of the alias status subscription (§20.2.1.3 step 2).
@@ -49,6 +51,20 @@ data class McvideoInfo(
     val calledFunctionalAlias: String? = null,
     val callToFunctionalAlias: Boolean? = null,
     val reqType: String? = null,
+    /**
+     * In `<anyExt>` (annex F.1.3): <end-to-end-security> "true", the request for an end-to-end protected ad hoc group
+     * call (§22.2.2.1.1 step 10 d) iii)), and <preconfigured-group-id>, the preconfigured group whose security related
+     * information (its GMK) keys it (§22.2.2.1.1 2xx step 3, §22.2.2.1.2 step 8).
+     */
+    val endToEndSecurity: Boolean? = null,
+    val preconfiguredGroupId: String? = null,
+    /**
+     * The server's area notices (TS 24.281 §11.2.1.4, §11.2.1.5): <emergency-alert-area-ind> and <group-geo-area-ind>
+     * in `<anyExt>`, and the group a group geographic area belongs to in <associated-group-id>.
+     */
+    val emergencyAlertArea: Boolean? = null,
+    val groupGeoArea: Boolean? = null,
+    val associatedGroupId: String? = null,
 ) {
     fun encode(): String = Xml.document("mcvideoinfo", NAMESPACE) {
         element("mcvideo-Params") {
@@ -64,16 +80,24 @@ data class McvideoInfo(
             wrapped("originated-by", originatedBy, "mcvideoURI")
             wrapped("mcvideo-client-id", clientId, "mcvideoString")
             wrapped("video-pull-url", videoPullUrl, "mcvideoURI")
-            if (ambientViewingType != null || participantCriteria != null || adhocAlert != null || adhocAlertReceived != null ||
-                functionalAlias != null || calledFunctionalAlias != null || callToFunctionalAlias != null || reqType != null) element("anyExt") {
+            // Annex F.1.2 types <associated-group-id> xs:string: the group identity is its text.
+            leaf("associated-group-id", associatedGroupId)
+            if (emergencyAlertArea != null || groupGeoArea != null || ambientViewingType != null || participantCriteria != null || adhocAlert != null || adhocAlertReceived != null || adhocEmergency != null ||
+                functionalAlias != null || calledFunctionalAlias != null || callToFunctionalAlias != null || reqType != null ||
+                endToEndSecurity != null || preconfiguredGroupId != null) element("anyExt") {
                 leaf("ambient-viewing-type", ambientViewingType)
                 leaf("call-participants-criteria", participantCriteria)
+                leaf("adhoc-emergency-ind", adhocEmergency?.toString())
                 leaf("adhoc-alert-ind", adhocAlert?.toString())
                 leaf("adhoc-alert-ind-rcvd", adhocAlertReceived?.toString())
                 wrapped("functional-alias-URI", functionalAlias, "mcvideoURI")
                 wrapped("called-functional-alias-URI", calledFunctionalAlias, "mcvideoURI")
                 leaf("call-to-functional-alias-ind", callToFunctionalAlias?.toString())
                 leaf("req-type", reqType)
+                leaf("end-to-end-security", endToEndSecurity?.toString())
+                wrapped("preconfigured-group-id", preconfiguredGroupId, "mcvideoURI")
+                leaf("emergency-alert-area-ind", emergencyAlertArea?.toString())
+                leaf("group-geo-area-ind", groupGeoArea?.toString())
             }
         }
     }
@@ -108,11 +132,20 @@ data class McvideoInfo(
                 releaseReason = params.descendants("release-reason").firstOrNull()?.text(),
                 participantCriteria = params.descendants("call-participants-criteria").firstOrNull()?.text(),
                 adhocAlert = params.descendants("adhoc-alert-ind").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
+                adhocEmergency = params.descendants("adhoc-emergency-ind").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
                 adhocAlertReceived = params.descendants("adhoc-alert-ind-rcvd").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
                 functionalAlias = params.descendants("functional-alias-URI").firstOrNull()?.text(),
                 calledFunctionalAlias = params.descendants("called-functional-alias-URI").firstOrNull()?.text(),
                 callToFunctionalAlias = params.descendants("call-to-functional-alias-ind").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
                 reqType = params.descendants("req-type").firstOrNull()?.text(),
+                endToEndSecurity = params.descendants("end-to-end-security").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
+                preconfiguredGroupId = params.descendants("preconfigured-group-id").firstOrNull()
+                    ?.let { it.child("mcvideoURI") ?: it }?.text()?.trim()?.ifEmpty { null },
+                emergencyAlertArea = params.descendants("emergency-alert-area-ind").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
+                groupGeoArea = params.descendants("group-geo-area-ind").firstOrNull()?.text()?.trim()?.let { it == "true" || it == "1" },
+                // In <mcvideo-Params> (annex F.1), or in <anyExt> (§9.2.1.2.1.1 step 14 d) i)).
+                associatedGroupId = (value("associated-group-id") ?: params.descendants("associated-group-id").firstOrNull()
+                    ?.let { it.child("mcvideoURI") ?: it }?.text())?.trim()?.ifEmpty { null },
             )
         }
     }

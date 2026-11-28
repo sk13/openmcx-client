@@ -417,7 +417,7 @@ Client::Client(Json cfg, bool disable_tls)
       sip_(client_sip_config(cfg_, disable_tls),
            {[this](const SipMessage &message) { return incoming(message); },
             [this](std::string_view id, SipCallState state, int code) {
-              if (pre_session_state(id, state)) return;
+              if (pre_session_state(id, state) || mcdata_pre_state(id, state)) return;
               if (mcvideo_closing(id, state) || mcvideo_call_state(id, state)) return;
               call_state(id, state, code);
             },
@@ -568,6 +568,7 @@ void Client::read_mcdata_profile() {
   mcdata_alert_entry_info_ = profile.group_alert_entry_info;
   mcdata_alert_entry_uri_ = profile.group_alert_uri;
   mcdata_profile_loaded_ = true;
+  take_mcdata_profile_rules(response.body); // TS 24.282 clauses 22.2.1.4 and 8.2.6.2 (mcdata/location_rules.cpp)
   status_["mcdata_profile"] = {{"user_id", profile.user_id},
                                {"profile_index", profile.profile_index},
                                {"actions", profile.actions},
@@ -735,6 +736,7 @@ void Client::registration_answered(const SipResponse &response) {
   // RFC 3261 section 10.2.4: refreshes keep the Call-ID; a new registration (another process, or after a network
   // deregistration, SipEngine::registration_ended) has its own. The response's dialog ID is its Call-ID.
   if (!response.dialog_id.empty()) registration_call_id_ = response.dialog_id;
+  registration_cseq_ = client_rules::cseq_number(get_header(response.headers, "CSeq"));
   // TS 24.229 clause 5.1.1.4.1: the duration of this registration, for the reregistration time of a shortened one
   // (core/reg_event.cpp): the expires parameter of the Contact or the Expires header field of the 200 (OK).
   {
@@ -934,10 +936,52 @@ void Client::provision_identity_keys() {
 }
 
 //------------------------------------------------------------------------------
-// Helper: one pass of the run loop: SIP events, the worker thread's results, due and scheduled tasks, control commands, floor and media packets,
+// openmcx-server prototype/resiprocate/PLAN.md phase 4: the sockets whose packets end the run loop's SIP wait: floor
+// control and audio, the live audio input, the MCVideo call, the multicast, MBMS and MCVideo multicast sockets, the
+// pre-established session's RTCP and the IP connectivity tunnel.
+std::vector<int> Client::wake_sockets() const {
+  std::vector<int> sockets{floor_.fd(), audio_.fd()};
+  const auto add = [&sockets](const std::unique_ptr<UdpSocket> &socket) {
+    if (socket) sockets.push_back(socket->fd());
+  };
+  add(live_);
+  if (mcvideo_call_) {
+    add(mcvideo_call_->audio);
+    add(mcvideo_call_->video);
+    add(mcvideo_call_->control);
+  }
+  add(multicast_socket_);
+  add(mcvideo_multicast_socket_);
+  for (const auto &[tmgi, bearer] : mbms_bearers_) add(bearer.socket);
+  if (pre_session_) add(pre_session_->rtcp);
+  add(ipcon_socket_);
+  if (live_video_fd_ >= 0) sockets.push_back(live_video_fd_);
+  return sockets;
+}
+
+//------------------------------------------------------------------------------
+// Helper: the floor control packets waiting on the floor control socket (up to 32), ICE checks of a pre-established
+// session aside (RFC 7983).
+void Client::floor_poll() {
+  for (int index = 0; index < 32; index++) {
+    auto datagram = floor_.receive();
+    if (!datagram) break;
+    if (pre_session_stun(IceStream::Control, 1, *datagram)) continue;
+    try {
+      floor_packet(*datagram);
+    } catch (const std::exception &error) {
+      status_["floor_rejected_packets"] = status_.value("floor_rejected_packets", 0ULL) + 1;
+      event("floor_rejected", {{"reason", error.what()}});
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// Helper: one pass of the run loop: SIP events (the wait ends early for a packet on a media socket, wake_sockets), the worker thread's results, due and scheduled tasks, control commands, floor and media packets,
 // the MCVideo media and the periodic tick.
 void Client::run_once() {
-  sip_.poll(std::chrono::milliseconds(5));
+  const auto sockets = wake_sockets();
+  sip_.poll(std::chrono::milliseconds(5), sockets);
   // The results of the worker thread (token grants) run as scheduled tasks.
   for (auto &task : handoff_.take()) pending_.push_back(std::move(task));
   for (auto due = timed_.begin(); due != timed_.end() && due->first <= monotonic_ms(); due = timed_.erase(due))
@@ -954,22 +998,15 @@ void Client::run_once() {
     } catch (const std::exception &error) {
       failure(error.what());
     }
-  for (int index = 0; index < 32; index++) {
-    auto datagram = floor_.receive();
-    if (!datagram) break;
-    if (pre_session_stun(IceStream::Control, 1, *datagram)) continue; // RFC 7983: ICE checks of the session
-    try {
-      floor_packet(*datagram);
-    } catch (const std::exception &error) {
-      status_["floor_rejected_packets"] = status_.value("floor_rejected_packets", 0ULL) + 1;
-      event("floor_rejected", {{"reason", error.what()}});
-    }
-  }
+  floor_poll();
   receive_live_audio();
   if (mcvideo_enabled()) receive_live_video();
   multicast_poll();
   mbms_poll();
   mcvideo_multicast_poll();
+  // Again before the speech: a Floor Taken that arrived while the subchannels were served (joining one sends a SIP
+  // request) names the SSRC of the speech behind it, which audio_packet would otherwise drop as unknown.
+  floor_poll();
   for (int index = 0; index < 32; index++) {
     auto datagram = audio_.receive();
     if (!datagram) break;
